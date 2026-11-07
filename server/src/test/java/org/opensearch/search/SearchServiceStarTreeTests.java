@@ -1076,6 +1076,92 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         setStarTreeIndexSetting(null);
     }
 
+    /**
+     * Star-tree pre-computation covers a whole segment, so it must not run on intra-segment partitions, which would each
+     * add the whole segment. The decision depends on the
+     * star-tree query context, so the context must already be set when it is made. Segment-level concurrent search is
+     * still used, and requests the star-tree cannot resolve are unaffected.
+     */
+    public void testStarTreeRequestsAreNotPartitioned() throws IOException {
+        try {
+            setStarTreeIndexSetting("true");
+            CreateIndexRequestBuilder builder = client().admin()
+                .indices()
+                .prepareCreate("test")
+                .setSettings(starStreeEnabledIndexSettings)
+                .setMapping(
+                    StarTreeFilterTests.getExpandedMapping(
+                        1,
+                        false,
+                        StarTreeFilterTests.DIMENSION_TYPE_MAP,
+                        StarTreeFilterTests.METRIC_TYPE_MAP
+                    )
+                );
+            createIndex("test", builder);
+            IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+            ShardSearchRequest request = new ShardSearchRequest(
+                OriginalIndices.NONE,
+                new SearchRequest().allowPartialSearchResults(true),
+                indexShard.shardId(),
+                1,
+                new AliasFilter(null, Strings.EMPTY_ARRAY),
+                1.0f,
+                -1,
+                null,
+                null
+            );
+            // No query and a metric aggregation: eligible for intra-segment search unless the star-tree resolves it
+            SearchSourceBuilder starTreeSource = new SearchSourceBuilder().size(0).aggregation(max("test").field("field"));
+            SearchSourceBuilder starTreeFilteredSource = new SearchSourceBuilder().size(0)
+                .query(new TermQueryBuilder("sndv", 1))
+                .aggregation(max("test").field("field"));
+            // "dv" is a dimension but not a star-tree metric, so the star-tree cannot resolve this one
+            SearchSourceBuilder regularSource = new SearchSourceBuilder().size(0).aggregation(max("test").field("dv"));
+            for (String mode : List.of(
+                SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_AUTO,
+                SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_ALL
+            )) {
+                setConcurrentSearchMode(mode);
+                assertSearchDecisions(request, starTreeSource, true, true, false);
+                assertSearchDecisions(request, starTreeFilteredSource, true, true, false);
+                assertSearchDecisions(request, regularSource, false, true, true);
+            }
+        } finally {
+            setConcurrentSearchMode(null);
+            setStarTreeIndexSetting(null);
+        }
+    }
+
+    private void setConcurrentSearchMode(String mode) {
+        Settings.Builder settings = Settings.builder();
+        if (mode == null) {
+            settings.putNull(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE.getKey());
+        } else {
+            settings.put(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE.getKey(), mode);
+        }
+        client().admin().cluster().prepareUpdateSettings().setTransientSettings(settings).get();
+    }
+
+    private void assertSearchDecisions(
+        ShardSearchRequest request,
+        SearchSourceBuilder sourceBuilder,
+        boolean expectStarTree,
+        boolean expectConcurrent,
+        boolean expectIntraSegment
+    ) throws IOException {
+        request.source(sourceBuilder);
+        SearchService searchService = getInstanceFromNode(SearchService.class);
+        try (
+            ReaderContext reader = searchService.createOrGetReaderContext(request, false);
+            SearchContext context = searchService.createContext(reader, request, null, true)
+        ) {
+            String shape = sourceBuilder.toString();
+            assertEquals(shape, expectStarTree, context.getQueryShardContext().getStarTreeQueryContext() != null);
+            assertEquals(shape, expectConcurrent, context.shouldUseConcurrentSearch());
+            assertEquals(shape, expectIntraSegment, context.shouldUseIntraSegmentSearch());
+        }
+    }
+
     private void setStarTreeIndexSetting(String value) {
         client().admin()
             .cluster()

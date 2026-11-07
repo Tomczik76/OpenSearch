@@ -9,7 +9,12 @@
 package org.opensearch.search.startree.filter;
 
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
+import org.opensearch.search.internal.SearchContext;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +43,22 @@ public class StarTreeFilter {
                 .filter(filters -> filters != null && !filters.isEmpty() && dimension.equals(filters.getFirst().getMatchingDimension()))
                 .findFirst()
                 .orElse(null);
+    }
+
+    /**
+     * This filter with every dimension filter bound to one segment, see {@link DimensionFilter#forSegment}.
+     * Concurrent search slices share a request's filter, so traversals must use the bound copy.
+     */
+    public StarTreeFilter forSegment(StarTreeValues starTreeValues, SearchContext searchContext) throws IOException {
+        Map<String, List<DimensionFilter>> bound = new HashMap<>(dimensionFilterMap.size());
+        for (Map.Entry<String, List<DimensionFilter>> entry : dimensionFilterMap.entrySet()) {
+            List<DimensionFilter> filters = new ArrayList<>(entry.getValue().size());
+            for (DimensionFilter filter : entry.getValue()) {
+                filters.add(filter.forSegment(starTreeValues, searchContext));
+            }
+            bound.put(entry.getKey(), filters);
+        }
+        return new StarTreeFilter(bound);
     }
 
     public Set<String> getDimensions() {

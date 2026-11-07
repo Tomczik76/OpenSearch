@@ -38,7 +38,9 @@ public class MatchAllFilter implements DimensionFilter {
     }
 
     @Override
-    public void initialiseForSegment(StarTreeValues starTreeValues, SearchContext searchContext) throws IOException {}
+    public DimensionFilter forSegment(StarTreeValues starTreeValues, SearchContext searchContext) {
+        return this; // no per-segment state
+    }
 
     @Override
     public void matchStarTreeNodes(StarTreeNode parentNode, StarTreeValues starTreeValues, StarTreeNodeCollector collector)
