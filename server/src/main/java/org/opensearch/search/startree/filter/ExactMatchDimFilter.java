@@ -18,6 +18,7 @@ import org.opensearch.search.startree.StarTreeQueryHelper;
 import org.opensearch.search.startree.filter.provider.DimensionFilterMapper;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.TreeSet;
@@ -32,24 +33,28 @@ public final class ExactMatchDimFilter implements DimensionFilter {
 
     private final List<Object> rawValues;
 
-    // Segment specific, set only on the instances forSegment returns. Order is essential for successive binary search.
-    private final TreeSet<Long> convertedOrdinals;
+    // Segment specific, set only on the instances forSegment returns. The distinct ordinals in the order the set
+    // collects them, which successive binary searches over a node's children rely on, and sorted, for lookups.
+    private final long[] convertedOrdinals;
+    private final long[] sortedOrdinals;
 
     private final DimensionFilterMapper dimensionFilterMapper;
 
     public ExactMatchDimFilter(String dimensionName, List<Object> valuesToMatch) {
-        this(dimensionName, valuesToMatch, null, null);
+        this(dimensionName, valuesToMatch, null, null, null);
     }
 
     private ExactMatchDimFilter(
         String dimensionName,
         List<Object> valuesToMatch,
-        TreeSet<Long> convertedOrdinals,
+        long[] convertedOrdinals,
+        long[] sortedOrdinals,
         DimensionFilterMapper dimensionFilterMapper
     ) {
         this.dimensionName = dimensionName;
         this.rawValues = valuesToMatch;
         this.convertedOrdinals = convertedOrdinals;
+        this.sortedOrdinals = sortedOrdinals;
         this.dimensionFilterMapper = dimensionFilterMapper;
     }
 
@@ -71,15 +76,19 @@ public final class ExactMatchDimFilter implements DimensionFilter {
             // Whereas Keyword type returning -ve ordinal indicates it doesn't exist in Star Tree Dimension values.
             ordinal.ifPresent(ordinals::add);
         }
-        return new ExactMatchDimFilter(dimensionName, rawValues, ordinals, mapper);
+        long[] inSetOrder = ordinals.stream().mapToLong(Long::longValue).toArray();
+        long[] sorted = inSetOrder.clone();
+        Arrays.sort(sorted);
+        return new ExactMatchDimFilter(dimensionName, rawValues, inSetOrder, sorted, mapper);
     }
 
     @Override
     public void matchStarTreeNodes(StarTreeNode parentNode, StarTreeValues starTreeValues, StarTreeNodeCollector collector)
         throws IOException {
+        requireBound();
         if (parentNode != null) {
             StarTreeNode lastMatchedNode = null;
-            for (long ordinal : boundOrdinals()) {
+            for (long ordinal : convertedOrdinals) {
                 lastMatchedNode = parentNode.getChildForDimensionValue(ordinal, lastMatchedNode, dimensionFilterMapper);
                 if (lastMatchedNode != null) {
                     collector.collectStarTreeNode(lastMatchedNode);
@@ -90,14 +99,15 @@ public final class ExactMatchDimFilter implements DimensionFilter {
 
     @Override
     public boolean matchDimValue(long ordinal, StarTreeValues starTreeValues) {
-        return boundOrdinals().contains(ordinal);
+        requireBound();
+        // Called once per remaining star-tree entry: no boxing, and no search for the common single value
+        return sortedOrdinals.length == 1 ? sortedOrdinals[0] == ordinal : Arrays.binarySearch(sortedOrdinals, ordinal) >= 0;
     }
 
-    private TreeSet<Long> boundOrdinals() {
+    private void requireBound() {
         if (convertedOrdinals == null) {
             throw new IllegalStateException("filter on [" + dimensionName + "] is not bound to a segment; use forSegment");
         }
-        return convertedOrdinals;
     }
 
     public List<Object> getRawValues() {
