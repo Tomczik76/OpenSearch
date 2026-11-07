@@ -63,7 +63,9 @@ public class StarTreeQueryContext {
         compositeMappedFieldType = (CompositeDataCubeFieldType) context.mapperService().getCompositeFieldTypes().iterator().next();
         // need to cache star tree values only for multiple aggregations
         boolean cacheStarTreeValues = context.aggregations().factories().getFactories().length > 1;
-        int cacheSize = cacheStarTreeValues ? context.indexShard().segments(false).size() : -1;
+        // Indexed by the searcher's leaf ordinals, so sized from the searcher: a reader kept across requests, such as a
+        // point in time, can have more segments than the shard has after a merge.
+        int cacheSize = cacheStarTreeValues ? context.searcher().getLeafContexts().size() : -1;
         if (cacheSize > -1) {
             perSegmentNodeIdsCache = new FixedBitSet[cacheSize];
         } else {
