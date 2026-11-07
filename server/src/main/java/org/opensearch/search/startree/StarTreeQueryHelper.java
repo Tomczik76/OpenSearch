@@ -220,8 +220,11 @@ public class StarTreeQueryHelper {
         for (String baseDimension : baseStarTreeFilter.getDimensions()) {
             dimensionFilterMap.put(baseDimension, baseStarTreeFilter.getFiltersForDimension(baseDimension));
         }
-        // Don't add groupBy when already present in base filter.
-        if (!dimensionFilterMap.containsKey(dimensionToMerge)) {
+        // Don't add groupBy when already present in base filter. A base filter on a date sub-dimension is stored
+        // under the field's name (e.g. "@timestamp" for "@timestamp_hour"), so compare matching dimensions too:
+        // traversal looks the sub-dimension up by key first and would apply only the groupBy's match-all.
+        if (dimensionFilterMap.containsKey(dimensionToMerge) == false
+            && baseStarTreeFilter.getMatchingDimensions().contains(dimensionToMerge) == false) {
             dimensionFilterMap.put(dimensionToMerge, dimensionFiltersToMerge);
         }
         return new StarTreeFilter(dimensionFilterMap);

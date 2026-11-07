@@ -21,6 +21,7 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -42,6 +43,7 @@ import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregatorTestCase;
@@ -50,6 +52,8 @@ import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 
 import java.io.IOException;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -66,6 +70,7 @@ import static org.opensearch.test.InternalAggregationTestCase.DEFAULT_MAX_BUCKET
 
 public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCase {
     private static final String TIMESTAMP_FIELD = "@timestamp";
+    private static final long DAY_MILLIS = 24 * 60 * 60 * 1000L;
     private static final MappedFieldType TIMESTAMP_FIELD_TYPE = new DateFieldMapper.DateFieldType(TIMESTAMP_FIELD);
 
     private static final String FIELD_NAME = "status";
@@ -111,7 +116,7 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
                 val = random.nextInt(100); // Random int between 0 and 99 for size
                 doc.add(new SortedNumericDocValuesField(SIZE, val));
             }
-            date = random.nextInt(180) * 24 * 60 * 60 * 1000L; // Random date within 180 days
+            date = random.nextInt(180) * DAY_MILLIS; // Random date within 180 days
             doc.add(new SortedNumericDocValuesField(TIMESTAMP_FIELD, date));
             doc.add(new LongPoint(TIMESTAMP_FIELD, date));
             iw.addDocument(doc);
@@ -206,6 +211,34 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
                     .subAggregation(aggregationBuilder);
                 testCase(indexSearcher, query, queryBuilder, dateHistogramAggregationBuilder, starTree, supportedDimensions);
             }
+
+            // A time window and a histogram on the interval the window resolves on, a coarser one and a finer one. The
+            // window is stored under the field's name and the histogram groups on a sub-dimension: the window must still apply.
+            for (int cases = 0; cases < 20; cases++) {
+                long from;
+                long to;
+                if (randomBoolean()) {
+                    // Day-aligned window: resolves on @timestamp_day
+                    from = random.nextInt(170) * DAY_MILLIS;
+                    to = from + (1 + random.nextInt(10)) * DAY_MILLIS;
+                } else {
+                    // Month-aligned window: resolves on @timestamp_month
+                    int month = random.nextInt(5);
+                    from = ZonedDateTime.of(1970, 1 + month, 1, 0, 0, 0, 0, ZoneOffset.UTC).toInstant().toEpochMilli();
+                    to = ZonedDateTime.of(1970, 2 + month, 1, 0, 0, 0, 0, ZoneOffset.UTC).toInstant().toEpochMilli();
+                }
+                query = new IndexOrDocValuesQuery(
+                    LongPoint.newRangeQuery(TIMESTAMP_FIELD, from, to - 1),
+                    SortedNumericDocValuesField.newSlowRangeQuery(TIMESTAMP_FIELD, from, to - 1)
+                );
+                queryBuilder = new RangeQueryBuilder(TIMESTAMP_FIELD).gte(from).lt(to).format("epoch_millis");
+                for (DateHistogramInterval interval : List.of(DateHistogramInterval.DAY, DateHistogramInterval.MONTH)) {
+                    dateHistogramAggregationBuilder = dateHistogram("by_" + interval).field(TIMESTAMP_FIELD)
+                        .calendarInterval(interval)
+                        .subAggregation(aggregationBuilder);
+                    testCase(indexSearcher, query, queryBuilder, dateHistogramAggregationBuilder, starTree, supportedDimensions, true);
+                }
+            }
         }
         ir.close();
         directory.close();
@@ -218,6 +251,22 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         DateHistogramAggregationBuilder dateHistogramAggregationBuilder,
         CompositeIndexFieldInfo starTree,
         LinkedHashMap<Dimension, MappedFieldType> supportedDimensions
+    ) throws IOException {
+        testCase(indexSearcher, query, queryBuilder, dateHistogramAggregationBuilder, starTree, supportedDimensions, false);
+    }
+
+    private static List<InternalDateHistogram.Bucket> nonEmpty(InternalDateHistogram histogram) {
+        return histogram.getBuckets().stream().filter(bucket -> bucket.getDocCount() > 0).toList();
+    }
+
+    private void testCase(
+        IndexSearcher indexSearcher,
+        Query query,
+        QueryBuilder queryBuilder,
+        DateHistogramAggregationBuilder dateHistogramAggregationBuilder,
+        CompositeIndexFieldInfo starTree,
+        LinkedHashMap<Dimension, MappedFieldType> supportedDimensions,
+        boolean nonEmptyBucketsOnly
     ) throws IOException {
         InternalDateHistogram starTreeAggregation = searchAndReduceStarTree(
             createIndexSettings(),
@@ -253,6 +302,11 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
             NUMBER_FIELD_TYPE
         );
 
+        if (nonEmptyBucketsOnly) {
+            // With a range query on the histogram's field, the default path can add empty buckets from the range's bounds
+            assertEquals(nonEmpty(defaultAggregation), nonEmpty(starTreeAggregation));
+            return;
+        }
         assertEquals(defaultAggregation.getBuckets().size(), starTreeAggregation.getBuckets().size());
         assertEquals(defaultAggregation.getBuckets(), starTreeAggregation.getBuckets());
     }

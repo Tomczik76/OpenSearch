@@ -42,6 +42,7 @@ import org.opensearch.search.startree.StarTreeQueryHelper;
 import org.opensearch.search.startree.StarTreeTraversalUtil;
 import org.opensearch.search.startree.filter.DimensionFilter;
 import org.opensearch.search.startree.filter.ExactMatchDimFilter;
+import org.opensearch.search.startree.filter.MatchAllFilter;
 import org.opensearch.search.startree.filter.RangeMatchDimFilter;
 import org.opensearch.search.startree.filter.StarTreeFilter;
 
@@ -52,6 +53,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.mockito.Mockito;
 
@@ -103,6 +105,7 @@ public class StarTreeFilterTests extends AggregatorTestCase {
 
         DimensionFilter exactMatchDimFilter = new ExactMatchDimFilter(dimensionToMerge, Collections.emptyList());
         DimensionFilter rangeMatchDimFilter = new RangeMatchDimFilter(dimensionToMerge, null, null, true, true);
+        DimensionFilter statusRangeMatchDimFilter = new RangeMatchDimFilter("status", null, null, true, true);
 
         // When Star Tree doesn't have the same dimension as @dimensionToMerge
         StarTreeFilter starTreeFilter = new StarTreeFilter(Collections.emptyMap());
@@ -127,7 +130,9 @@ public class StarTreeFilterTests extends AggregatorTestCase {
         assertEquals(RangeMatchDimFilter.class, mergedDimensionFilter2.getClass());
 
         // When Star Tree has the same dimension as @dimensionToMerge with other dimensions
-        starTreeFilter = new StarTreeFilter(Map.of(dimensionToMerge, List.of(rangeMatchDimFilter), "status", List.of(rangeMatchDimFilter)));
+        starTreeFilter = new StarTreeFilter(
+            Map.of(dimensionToMerge, List.of(rangeMatchDimFilter), "status", List.of(statusRangeMatchDimFilter))
+        );
         mergedStarTreeFilter = StarTreeQueryHelper.mergeDimensionFilterIfNotExists(
             starTreeFilter,
             dimensionToMerge,
@@ -140,7 +145,7 @@ public class StarTreeFilterTests extends AggregatorTestCase {
         assertEquals(RangeMatchDimFilter.class, mergedDimensionFilter4.getClass());
 
         // When Star Tree doesn't have the same dimension as @dimensionToMerge but has other dimensions
-        starTreeFilter = new StarTreeFilter(Map.of("status", List.of(rangeMatchDimFilter)));
+        starTreeFilter = new StarTreeFilter(Map.of("status", List.of(statusRangeMatchDimFilter)));
         mergedStarTreeFilter = StarTreeQueryHelper.mergeDimensionFilterIfNotExists(
             starTreeFilter,
             dimensionToMerge,
@@ -152,6 +157,47 @@ public class StarTreeFilterTests extends AggregatorTestCase {
         DimensionFilter mergedDimensionFilter6 = mergedStarTreeFilter.getFiltersForDimension("status").get(0);
         assertEquals(RangeMatchDimFilter.class, mergedDimensionFilter6.getClass());
 
+    }
+
+    /**
+     * A time window resolved on {@code @timestamp_hour} is stored under the field's name. An hourly date histogram adds its
+     * match-all under {@code @timestamp_hour}; it must not be merged beside the window, because traversal looks the
+     * sub-dimension up by key first and would then apply only the match-all, ignoring the window.
+     */
+    public void testGroupByOnTheSubDimensionOfABaseFilterIsNotMerged() {
+        DimensionFilter window = hourWindow();
+        StarTreeFilter base = new StarTreeFilter(Map.of("@timestamp", List.of(window)));
+
+        StarTreeFilter merged = StarTreeQueryHelper.mergeDimensionFilterIfNotExists(
+            base,
+            "@timestamp_hour",
+            List.of(new MatchAllFilter("@timestamp", "@timestamp_hour"))
+        );
+
+        assertEquals(Set.of("@timestamp"), merged.getDimensions());
+        assertSame(window, merged.getFiltersForDimension("@timestamp_hour").getFirst());
+    }
+
+    /** A group-by on another sub-dimension of the same field is still merged, next to the window. */
+    public void testGroupByOnAnotherSubDimensionIsMerged() {
+        DimensionFilter window = hourWindow();
+        StarTreeFilter base = new StarTreeFilter(Map.of("@timestamp", List.of(window)));
+        MatchAllFilter daily = new MatchAllFilter("@timestamp", "@timestamp_day");
+
+        StarTreeFilter merged = StarTreeQueryHelper.mergeDimensionFilterIfNotExists(base, "@timestamp_day", List.of(daily));
+
+        assertEquals(Set.of("@timestamp", "@timestamp_day"), merged.getDimensions());
+        assertSame(window, merged.getFiltersForDimension("@timestamp_hour").getFirst());
+        assertSame(daily, merged.getFiltersForDimension("@timestamp_day").getFirst());
+    }
+
+    /** A window filter as the merge sees it: stored under the field's name, matching the field's hour sub-dimension. */
+    private static DimensionFilter hourWindow() {
+        DimensionFilter window = Mockito.mock(DimensionFilter.class);
+        Mockito.when(window.getDimensionName()).thenReturn("@timestamp");
+        Mockito.when(window.getSubDimensionName()).thenReturn("@timestamp_hour");
+        Mockito.when(window.getMatchingDimension()).thenReturn("@timestamp_hour");
+        return window;
     }
 
     private Directory createStarTreeIndex(int maxLeafDoc, boolean skipStarNodeCreationForSDVDimension, List<Document> docs)
