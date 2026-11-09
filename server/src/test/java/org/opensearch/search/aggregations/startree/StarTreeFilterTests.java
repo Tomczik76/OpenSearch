@@ -43,6 +43,7 @@ import org.opensearch.search.startree.StarTreeTraversalUtil;
 import org.opensearch.search.startree.filter.DimensionFilter;
 import org.opensearch.search.startree.filter.ExactMatchDimFilter;
 import org.opensearch.search.startree.filter.MatchAllFilter;
+import org.opensearch.search.startree.filter.MatchNoneFilter;
 import org.opensearch.search.startree.filter.RangeMatchDimFilter;
 import org.opensearch.search.startree.filter.StarTreeFilter;
 
@@ -224,6 +225,70 @@ public class StarTreeFilterTests extends AggregatorTestCase {
         iw.forceMerge(1);
         iw.close();
         return directory;
+    }
+
+    /**
+     * A filter that matches nothing, such as a numeric range beyond the field type's bounds, on a dimension below the
+     * leaves matches no entry. It used to fail the request: it names no dimension to read values from.
+     */
+    public void testMatchNoneFilterBelowTheLeavesMatchesNothing() throws IOException {
+        List<Document> docs = new ArrayList<>();
+        // Every value of the first dimension is unique, so every first-level node is a leaf
+        Directory directory = createStarTreeIndex(5, true, docs);
+        DirectoryReader ir = DirectoryReader.open(directory);
+        initValuesSourceRegistry();
+        LeafReaderContext context = ir.leaves().get(0);
+        CompositeIndexReader starTreeDocValuesReader = (CompositeIndexReader) Lucene.segmentReader(context.reader()).getDocValuesReader();
+        MapperService mapperService = Mockito.mock(MapperService.class);
+        SearchContext searchContext = Mockito.mock(SearchContext.class);
+        Mockito.when(searchContext.mapperService()).thenReturn(mapperService);
+        for (String dimension : List.of(SNDV, SDV, DV)) {
+            Mockito.when(mapperService.fieldType(dimension))
+                .thenReturn(new NumberFieldMapper.NumberFieldType(dimension, NumberFieldMapper.NumberType.INTEGER));
+        }
+
+        StarTreeFilter matchNone = new StarTreeFilter(Map.of(DV, List.of(new MatchNoneFilter())));
+        assertEquals(0, getDocCountFromStarTree(starTreeDocValuesReader, matchNone, context, searchContext));
+        StarTreeFilter withAnotherDimension = new StarTreeFilter(
+            Map.of(SNDV, List.of(new ExactMatchDimFilter(SNDV, List.of(0L))), DV, List.of(new MatchNoneFilter()))
+        );
+        assertEquals(0, getDocCountFromStarTree(starTreeDocValuesReader, withAnotherDimension, context, searchContext));
+        ir.close();
+        directory.close();
+    }
+
+    /**
+     * A filter that matches nothing, OR'd with one that matches, on a dimension below the leaves matches what the other one
+     * matches, in either order. The values of a dimension below the leaves are read from the dimension its first filter
+     * names, and a filter that matches nothing names none.
+     */
+    public void testMatchNoneFilterAmongAlternativesBelowTheLeavesMatchesTheOthers() throws IOException {
+        List<Document> docs = new ArrayList<>();
+        // Every value of the first dimension is unique, so every first-level node is a leaf
+        try (Directory directory = createStarTreeIndex(5, true, docs); DirectoryReader ir = DirectoryReader.open(directory)) {
+            initValuesSourceRegistry();
+            LeafReaderContext context = ir.leaves().get(0);
+            CompositeIndexReader starTreeDocValuesReader = (CompositeIndexReader) Lucene.segmentReader(context.reader())
+                .getDocValuesReader();
+            MapperService mapperService = Mockito.mock(MapperService.class);
+            SearchContext searchContext = Mockito.mock(SearchContext.class);
+            Mockito.when(searchContext.mapperService()).thenReturn(mapperService);
+            for (String dimension : List.of(SNDV, SDV, DV)) {
+                Mockito.when(mapperService.fieldType(dimension))
+                    .thenReturn(new NumberFieldMapper.NumberFieldType(dimension, NumberFieldMapper.NumberType.INTEGER));
+            }
+            long expected = getDocCount(docs, Map.of(DV, 4L));
+            assertEquals(1, expected);
+
+            StarTreeFilter matchNoneLast = new StarTreeFilter(
+                Map.of(DV, List.of(new ExactMatchDimFilter(DV, List.of(4L)), new MatchNoneFilter()))
+            );
+            assertEquals(expected, getDocCountFromStarTree(starTreeDocValuesReader, matchNoneLast, context, searchContext));
+            StarTreeFilter matchNoneFirst = new StarTreeFilter(
+                Map.of(DV, List.of(new MatchNoneFilter(), new ExactMatchDimFilter(DV, List.of(4L))))
+            );
+            assertEquals(expected, getDocCountFromStarTree(starTreeDocValuesReader, matchNoneFirst, context, searchContext));
+        }
     }
 
     private void testStarTreeFilter(int maxLeafDoc, boolean skipStarNodeCreationForSDVDimension) throws IOException {
