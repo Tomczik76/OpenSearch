@@ -55,13 +55,14 @@ public class BoolStarTreeFilterProvider implements StarTreeFilterProvider {
         if (boolQuery.minimumShouldMatch() != null) {
             return null; // We cannot support this yet and would need special handling while processing SHOULD clause
         }
+        if (boolQuery.mustNot().isEmpty() == false) {
+            return null; // The star-tree cannot exclude documents; ignoring the clause would count them
+        }
         if (boolQuery.must().isEmpty() == false || boolQuery.filter().isEmpty() == false) {
             return processMustClauses(getCombinedMustAndFilterClauses(boolQuery), context, compositeFieldType);
         }
-        if (boolQuery.should().isEmpty() == false) {
-            return processShouldClauses(boolQuery.should(), context, compositeFieldType);
-        }
-        return null;
+        // The query has clauses, and none is a must_not, a must or a filter
+        return processShouldClauses(boolQuery.should(), context, compositeFieldType);
     }
 
     private StarTreeFilter processNonBoolSupportedQueries(

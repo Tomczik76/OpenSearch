@@ -1335,6 +1335,21 @@ public class BoolStarTreeFilterProviderTests extends OpenSearchTestCase {
         assertNull("Filter should be null for same dimension in MUST", filter);
     }
 
+    public void testMustNotNextToOtherClausesReturnsNull() throws IOException {
+        // The star-tree cannot exclude documents: a must_not next to other clauses must not be dropped
+        for (BoolQueryBuilder boolQuery : List.of(
+            new BoolQueryBuilder().filter(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200)),
+            new BoolQueryBuilder().must(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200)),
+            new BoolQueryBuilder().should(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200)),
+            new BoolQueryBuilder().filter(
+                new BoolQueryBuilder().must(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200))
+            )
+        )) {
+            StarTreeFilterProvider provider = StarTreeFilterProvider.SingletonFactory.getProvider(boolQuery);
+            assertNull(boolQuery.toString(), provider.getFilter(searchContext, boolQuery, compositeFieldType));
+        }
+    }
+
     // Helper methods for assertions
     private void assertExactMatchValue(ExactMatchDimFilter filter, String expectedValue) {
         assertEquals(new BytesRef(expectedValue), filter.getRawValues().getFirst());
