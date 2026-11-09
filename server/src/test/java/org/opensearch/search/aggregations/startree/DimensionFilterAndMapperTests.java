@@ -312,6 +312,42 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * An unsigned_long terms filter matches its values on both sides of 2^63. A node's children are sorted unsigned, and the
+     * filter searches them for one value after another, each search starting after the previous match: in signed order, a
+     * value of 2^63 or more came first and hid the smaller values.
+     */
+    public void testUnsignedLongTermsOnBothSidesOfTwoToTheSixtyThree() throws IOException {
+        // 3 documents of 5, 4 of 7, 5 of 2^63 + 1 and 6 of 2^64 - 1
+        List<String> unsignedValues = List.of("5", "7", "9223372036854775809", "18446744073709551615");
+        List<IndexableField> values = new ArrayList<>();
+        for (int i = 0; i < unsignedValues.size(); i++) {
+            for (int doc = 0; doc < 3 + i; doc++) {
+                values.add(new SortedNumericDocValuesField("unsigned", Long.parseUnsignedLong(unsignedValues.get(i))));
+            }
+        }
+        for (boolean belowTheLeaves : new boolean[] { false, true }) {
+            try (StarTreeSegment segment = indexStarTreeSegment("unsigned", "unsigned_long", values, belowTheLeaves)) {
+                String layout = "below the leaves: " + belowTheLeaves;
+                assertEquals(
+                    layout,
+                    Map.of("5", 3L, "9223372036854775809", 5L),
+                    segment.docCounts(new TermsQueryBuilder("unsigned", "5", "9223372036854775809"))
+                );
+                assertEquals(
+                    layout,
+                    Map.of("7", 4L, "18446744073709551615", 6L),
+                    segment.docCounts(new TermsQueryBuilder("unsigned", "7", "18446744073709551615"))
+                );
+                assertEquals(
+                    layout,
+                    Map.of("5", 3L, "7", 4L, "9223372036854775809", 5L, "18446744073709551615", 6L),
+                    segment.docCounts(new TermsQueryBuilder("unsigned", "18446744073709551615", "9223372036854775809", "7", "5"))
+                );
+            }
+        }
+    }
+
     /** An IP range whose upper bound is below every address of a segment matches nothing there, not everything. */
     public void testIpRangeBelowEveryAddressMatchesNothing() throws IOException {
         // Every address is above 10.0.0.1

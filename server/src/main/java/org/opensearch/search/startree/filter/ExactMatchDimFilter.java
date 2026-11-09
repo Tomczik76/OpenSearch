@@ -44,7 +44,6 @@ public class ExactMatchDimFilter implements DimensionFilter {
 
     @Override
     public void initialiseForSegment(StarTreeValues starTreeValues, SearchContext searchContext) {
-        convertedOrdinals = new TreeSet<>();
         Dimension matchedDim = StarTreeQueryHelper.getMatchingDimensionOrThrow(
             dimensionName,
             starTreeValues.getStarTreeField().getDimensionsOrder()
@@ -53,6 +52,9 @@ public class ExactMatchDimFilter implements DimensionFilter {
             searchContext.mapperService().fieldType(dimensionName),
             searchContext
         );
+        // Successive binary searches over a node's children need the ordinals in the children's order,
+        // which is unsigned for unsigned_long
+        convertedOrdinals = new TreeSet<>(dimensionFilterMapper.comparator());
 
         for (Object rawValue : rawValues) {
             Optional<Long> ordinal = dimensionFilterMapper.getMatchingOrdinal(
