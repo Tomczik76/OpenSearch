@@ -61,16 +61,7 @@ public class StarTreeDateHistogramWindowIT extends OpenSearchIntegTestCase {
     }
 
     public void testWindowIsAppliedWithAHistogramOnTheWindowsInterval() throws Exception {
-        createStarTreeIndex();
-        BulkRequestBuilder bulk = client().prepareBulk(INDEX);
-        for (int j = 0; j < DOCS; j++) {
-            bulk.add(
-                client().prepareIndex(INDEX)
-                    .setSource("@timestamp", timestamp(j), "service", service(j), "region", "r" + (j / 96) % 3, "value", value(j))
-            );
-        }
-        assertFalse(bulk.get().hasFailures());
-        refresh(INDEX);
+        createStarTreeIndexWithDocuments();
 
         long hourStart = T0 + 6 * HOUR;
         long hourEnd = T0 + 30 * HOUR;
@@ -97,6 +88,45 @@ public class StarTreeDateHistogramWindowIT extends OpenSearchIntegTestCase {
             readHistogram(serviceBucket.getAggregations(), serviceBucket.getKeyAsString() + "@", actual);
         }
         assertBuckets("terms > hourly histogram", expected, actual);
+    }
+
+    /** With profile, a histogram nested under terms must keep its buckets: the profiler wraps every sub-aggregator. */
+    public void testNestedHistogramIsTheSameWithProfile() throws Exception {
+        createStarTreeIndexWithDocuments();
+        AggregationBuilder aggregation = AggregationBuilders.terms("services")
+            .field("service")
+            .subAggregation(histogram(DateHistogramInterval.HOUR).subAggregation(AggregationBuilders.sum("total").field("value")));
+        Map<String, long[]> expected = expected(j -> true, j -> service(j) + "@" + timestamp(j));
+        for (boolean profile : new boolean[] { false, true }) {
+            long starTreeBefore = starTreeQueries();
+            Aggregations aggregations = client().prepareSearch(INDEX)
+                .setSize(0)
+                .setTrackTotalHits(false)
+                .setRequestCache(false)
+                .setProfile(profile)
+                .addAggregation(aggregation)
+                .get()
+                .getAggregations();
+            assertEquals("requests the star-tree answered", starTreeBefore + 1, starTreeQueries());
+            Map<String, long[]> actual = new TreeMap<>();
+            for (Terms.Bucket serviceBucket : ((Terms) aggregations.get("services")).getBuckets()) {
+                readHistogram(serviceBucket.getAggregations(), serviceBucket.getKeyAsString() + "@", actual);
+            }
+            assertBuckets("terms > hourly histogram, profile " + profile, expected, actual);
+        }
+    }
+
+    private void createStarTreeIndexWithDocuments() throws Exception {
+        createStarTreeIndex();
+        BulkRequestBuilder bulk = client().prepareBulk(INDEX);
+        for (int j = 0; j < DOCS; j++) {
+            bulk.add(
+                client().prepareIndex(INDEX)
+                    .setSource("@timestamp", timestamp(j), "service", service(j), "region", "r" + (j / 96) % 3, "value", value(j))
+            );
+        }
+        assertFalse(bulk.get().hasFailures());
+        refresh(INDEX);
     }
 
     /** A window and the service "A", with a histogram of the given interval. */

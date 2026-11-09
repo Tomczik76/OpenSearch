@@ -259,7 +259,8 @@ public class StarTreeQueryHelper {
         List<DimensionFilter> dimensionFiltersToMerge = new ArrayList<>(initialDimensionFilters);
 
         for (Aggregator subAgg : subAggregators) {
-            if (subAgg instanceof StarTreePreComputeCollector collector) {
+            // With profile, every sub-aggregator is wrapped in a ProfilingAggregator
+            if (subAgg.unwrapAggregator() instanceof StarTreePreComputeCollector collector) {
                 List<DimensionFilter> childFilters = collector.getDimensionFilters();
                 dimensionFiltersToMerge.addAll(childFilters != null ? childFilters : Collections.emptyList());
             }

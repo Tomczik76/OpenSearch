@@ -33,8 +33,10 @@ import org.opensearch.common.Rounding;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.core.indices.breaker.NoneCircuitBreakerService;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
 import org.opensearch.index.codec.composite.composite104.Composite104Codec;
@@ -54,6 +56,7 @@ import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
@@ -61,8 +64,11 @@ import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregat
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
+import org.opensearch.search.aggregations.bucket.terms.InternalTerms;
+import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.profile.Profilers;
 import org.opensearch.search.startree.StarTreeQueryContext;
 
 import java.io.Closeable;
@@ -84,6 +90,7 @@ import static org.opensearch.search.aggregations.AggregationBuilders.dateHistogr
 import static org.opensearch.search.aggregations.AggregationBuilders.max;
 import static org.opensearch.search.aggregations.AggregationBuilders.min;
 import static org.opensearch.search.aggregations.AggregationBuilders.sum;
+import static org.opensearch.search.aggregations.AggregationBuilders.terms;
 import static org.opensearch.test.InternalAggregationTestCase.DEFAULT_MAX_BUCKETS;
 import static org.mockito.Mockito.when;
 
@@ -97,6 +104,10 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         FIELD_NAME,
         NumberFieldMapper.NumberType.LONG
     );
+    private static final MappedFieldType SIZE_FIELD_TYPE = new NumberFieldMapper.NumberFieldType(
+        "size",
+        NumberFieldMapper.NumberType.INTEGER
+    );
 
     // The calendar intervals of the star-tree's date dimension in getExpandedMapping(int, boolean)
     private static final List<Rounding.DateTimeUnit> MONTH_AND_DAY = List.of(
@@ -108,6 +119,33 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         new Metric("size", List.of(MetricStat.SUM, MetricStat.VALUE_COUNT, MetricStat.MIN, MetricStat.MAX)),
         new Metric("status", List.of(MetricStat.SUM, MetricStat.VALUE_COUNT, MetricStat.MIN, MetricStat.MAX))
     );
+
+    // Whether the search contexts created from now on profile the search, which wraps every sub-aggregator in a ProfilingAggregator
+    private boolean profile;
+
+    @Override
+    protected SearchContext createSearchContext(
+        IndexSearcher indexSearcher,
+        IndexSettings indexSettings,
+        Query query,
+        MultiBucketConsumer bucketConsumer,
+        CircuitBreakerService circuitBreakerService,
+        MappedFieldType... fieldTypes
+    ) throws IOException {
+        SearchContext searchContext = super.createSearchContext(
+            indexSearcher,
+            indexSettings,
+            query,
+            bucketConsumer,
+            circuitBreakerService,
+            fieldTypes
+        );
+        if (profile) {
+            Profilers profilers = new Profilers(searchContext.searcher(), false);
+            when(searchContext.getProfilers()).thenReturn(profilers);
+        }
+        return searchContext;
+    }
 
     protected Codec getCodec() {
         return getCodec(MONTH_AND_DAY);
@@ -346,6 +384,72 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         }
     }
 
+    /**
+     * With profile, every sub-aggregator is wrapped in a ProfilingAggregator. A date histogram nested under terms must still
+     * add its calendar interval to the star-tree's traversal, and get the default aggregation's buckets: the wrapped histogram
+     * used not to be recognised, so the traversal kept only the entries with no date, and the histogram came back empty.
+     */
+    public void testHistogramNestedUnderTermsIsTheSameWithProfile() throws IOException {
+        TermsAggregationBuilder aggregation = terms("by_size").field("size").subAggregation(histogram(DateHistogramInterval.DAY));
+        Query query = new MatchAllDocsQuery();
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                MONTH_AND_DAY,
+                "1970-01-05T10:00:00Z",
+                "1970-01-05T20:00:00Z",
+                "1970-01-07T12:00:00Z"
+            )
+        ) {
+            assertTrue("the star-tree must serve " + aggregation, searchUsesStarTree(segment, query, null, aggregation));
+            InternalTerms<?, ?> defaultTerms = searchNestedHistogram(segment, aggregation, false);
+            assertEquals(
+                List.of("1: 3 docs, [1970-01-05T00:00:00.000Z: 2 docs, 1970-01-07T00:00:00.000Z: 1 docs]"),
+                describe(defaultTerms)
+            );
+            for (boolean profileSearch : new boolean[] { false, true }) {
+                profile = profileSearch;
+                InternalTerms<?, ?> starTreeTerms = searchNestedHistogram(segment, aggregation, true);
+                assertEquals("profile " + profileSearch, describe(defaultTerms), describe(starTreeTerms));
+                assertEquals("profile " + profileSearch, defaultTerms.getBuckets(), starTreeTerms.getBuckets());
+            }
+        } finally {
+            profile = false;
+        }
+    }
+
+    // Terms buckets, each with the non-empty buckets of its date histogram, readable in a failure message
+    private static List<String> describe(InternalTerms<?, ?> terms) {
+        return terms.getBuckets().stream().map(bucket -> {
+            InternalDateHistogram histogram = bucket.getAggregations().get("by_" + DateHistogramInterval.DAY);
+            List<String> histogramBuckets = nonEmpty(histogram).stream()
+                .map(histogramBucket -> histogramBucket.getKeyAsString() + ": " + histogramBucket.getDocCount() + " docs")
+                .toList();
+            return bucket.getKeyAsString() + ": " + bucket.getDocCount() + " docs, " + histogramBuckets;
+        }).toList();
+    }
+
+    // Searches the terms aggregation with or without the star-tree; with the star-tree, checks that no document is collected
+    private InternalTerms<?, ?> searchNestedHistogram(StarTreeSegment segment, TermsAggregationBuilder aggregation, boolean starTree)
+        throws IOException {
+        return searchAndReduceStarTree(
+            createIndexSettings(),
+            segment.searcher(),
+            new MatchAllDocsQuery(),
+            null,
+            aggregation,
+            starTree ? segment.starTree() : null,
+            starTree ? segment.dimensions() : null,
+            null,
+            DEFAULT_MAX_BUCKETS,
+            false,
+            null,
+            starTree,
+            TIMESTAMP_FIELD_TYPE,
+            NUMBER_FIELD_TYPE,
+            SIZE_FIELD_TYPE
+        );
+    }
+
     private void testCase(
         IndexSearcher indexSearcher,
         Query query,
@@ -473,12 +577,8 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
      * Whether a search serves the request from the star-tree: {@link StarTreeQueryContext#consolidateAllFilters} accepts the
      * request's query and aggregations.
      */
-    private boolean searchUsesStarTree(
-        StarTreeSegment segment,
-        Query query,
-        QueryBuilder queryBuilder,
-        DateHistogramAggregationBuilder histogram
-    ) throws IOException {
+    private boolean searchUsesStarTree(StarTreeSegment segment, Query query, QueryBuilder queryBuilder, AggregationBuilder aggregation)
+        throws IOException {
         MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
             DEFAULT_MAX_BUCKETS,
             new NoneCircuitBreakerService().getBreaker(CircuitBreaker.REQUEST)
@@ -497,7 +597,7 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
             NUMBER_FIELD_TYPE
         );
         AggregatorFactories aggregations = AggregatorFactories.builder()
-            .addAggregator(histogram.rewrite(searchContext.getQueryShardContext()))
+            .addAggregator(aggregation.rewrite(searchContext.getQueryShardContext()))
             .build(searchContext.getQueryShardContext(), null);
         when(searchContext.aggregations()).thenReturn(new SearchContextAggregations(aggregations, bucketConsumer));
         return new StarTreeQueryContext(searchContext, queryBuilder).consolidateAllFilters(searchContext);
