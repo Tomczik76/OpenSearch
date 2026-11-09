@@ -21,6 +21,8 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -29,6 +31,9 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.opensearch.common.Rounding;
 import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.indices.breaker.NoneCircuitBreakerService;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
@@ -36,27 +41,40 @@ import org.opensearch.index.codec.composite.composite104.Composite104Codec;
 import org.opensearch.index.codec.composite912.datacube.startree.StarTreeDocValuesFormatTests;
 import org.opensearch.index.compositeindex.datacube.DateDimension;
 import org.opensearch.index.compositeindex.datacube.Dimension;
+import org.opensearch.index.compositeindex.datacube.Metric;
+import org.opensearch.index.compositeindex.datacube.MetricStat;
 import org.opensearch.index.compositeindex.datacube.NumericDimension;
 import org.opensearch.index.compositeindex.datacube.startree.utils.date.DateTimeUnitAdapter;
+import org.opensearch.index.compositeindex.datacube.startree.utils.date.DateTimeUnitRounding;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
+import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
+import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.startree.StarTreeQueryContext;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
 import static org.opensearch.index.codec.composite912.datacube.startree.AbstractStarTreeDVFormatTests.topMapping;
@@ -67,6 +85,7 @@ import static org.opensearch.search.aggregations.AggregationBuilders.max;
 import static org.opensearch.search.aggregations.AggregationBuilders.min;
 import static org.opensearch.search.aggregations.AggregationBuilders.sum;
 import static org.opensearch.test.InternalAggregationTestCase.DEFAULT_MAX_BUCKETS;
+import static org.mockito.Mockito.when;
 
 public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCase {
     private static final String TIMESTAMP_FIELD = "@timestamp";
@@ -79,11 +98,26 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         NumberFieldMapper.NumberType.LONG
     );
 
+    // The calendar intervals of the star-tree's date dimension in getExpandedMapping(int, boolean)
+    private static final List<Rounding.DateTimeUnit> MONTH_AND_DAY = List.of(
+        Rounding.DateTimeUnit.MONTH_OF_YEAR,
+        Rounding.DateTimeUnit.DAY_OF_MONTH
+    );
+    // The star-tree's metrics in getExpandedMapping
+    private static final List<Metric> STAR_TREE_METRICS = List.of(
+        new Metric("size", List.of(MetricStat.SUM, MetricStat.VALUE_COUNT, MetricStat.MIN, MetricStat.MAX)),
+        new Metric("status", List.of(MetricStat.SUM, MetricStat.VALUE_COUNT, MetricStat.MIN, MetricStat.MAX))
+    );
+
     protected Codec getCodec() {
+        return getCodec(MONTH_AND_DAY);
+    }
+
+    private Codec getCodec(List<Rounding.DateTimeUnit> calendarIntervals) {
         final Logger testLogger = LogManager.getLogger(MetricAggregatorTests.class);
         MapperService mapperService;
         try {
-            mapperService = StarTreeDocValuesFormatTests.createMapperService(getExpandedMapping(1, false));
+            mapperService = StarTreeDocValuesFormatTests.createMapperService(getExpandedMapping(1, false, calendarIntervals));
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -244,6 +278,74 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         directory.close();
     }
 
+    /**
+     * OR'd date windows that resolve on different calendar intervals, narrowed by a window that excludes the first of them,
+     * match what the default aggregation matches. Each intersection with the narrowing window resolves on the finer interval
+     * of its pair, and the star-tree reads every filter of a dimension on the first filter's interval, so the intersected
+     * filters must be brought to one interval: here the month window comes first, and the day window, read on month, would
+     * match none of its documents.
+     */
+    public void testOrdWindowsOfMixedIntervalsNarrowedByWindow() throws IOException {
+        assertOrdWindowsOfMixedIntervalsNarrowedByWindow(false);
+    }
+
+    /**
+     * As {@link #testOrdWindowsOfMixedIntervalsNarrowedByWindow}, with the narrowing window first.
+     */
+    public void testWindowNarrowingOrdWindowsOfMixedIntervals() throws IOException {
+        assertOrdWindowsOfMixedIntervalsNarrowedByWindow(true);
+    }
+
+    private void assertOrdWindowsOfMixedIntervalsNarrowedByWindow(boolean narrowingWindowFirst) throws IOException {
+        // On the star-tree's intervals, the 10ths resolve on day, February and the first quarter on month
+        Window mayTenth = new Window("1970-05-10", "1970-05-11");
+        Window february = new Window("1970-02-01", "1970-03-01");
+        Window januaryTenth = new Window("1970-01-10", "1970-01-11");
+        Window firstQuarter = new Window("1970-01-01", "1970-04-01");
+        Query anyWindow = new BooleanQuery.Builder().add(mayTenth.query(), BooleanClause.Occur.SHOULD)
+            .add(february.query(), BooleanClause.Occur.SHOULD)
+            .add(januaryTenth.query(), BooleanClause.Occur.SHOULD)
+            .build();
+        QueryBuilder anyWindowBuilder = new BoolQueryBuilder().should(mayTenth.queryBuilder())
+            .should(february.queryBuilder())
+            .should(januaryTenth.queryBuilder());
+        Query query = new BooleanQuery.Builder().add(anyWindow, BooleanClause.Occur.FILTER)
+            .add(firstQuarter.query(), BooleanClause.Occur.FILTER)
+            .build();
+        QueryBuilder queryBuilder = narrowingWindowFirst
+            ? new BoolQueryBuilder().filter(firstQuarter.queryBuilder()).filter(anyWindowBuilder)
+            : new BoolQueryBuilder().filter(anyWindowBuilder).filter(firstQuarter.queryBuilder());
+
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                MONTH_AND_DAY,
+                "1970-01-05T10:00:00Z",
+                "1970-01-10T03:00:00Z",
+                "1970-01-10T20:00:00Z",
+                "1970-01-11T00:00:00Z",
+                "1970-02-01T00:00:00Z",
+                "1970-02-14T12:00:00Z",
+                "1970-03-01T00:00:00Z",
+                "1970-05-10T08:00:00Z"
+            )
+        ) {
+            assertStarTreeMatchesDefault(
+                segment,
+                query,
+                queryBuilder,
+                histogram(DateHistogramInterval.MONTH),
+                Map.of("1970-01-01T00:00:00.000Z", 2L, "1970-02-01T00:00:00.000Z", 2L)
+            );
+            assertStarTreeMatchesDefault(
+                segment,
+                query,
+                queryBuilder,
+                histogram(DateHistogramInterval.DAY),
+                Map.of("1970-01-10T00:00:00.000Z", 2L, "1970-02-01T00:00:00.000Z", 1L, "1970-02-14T00:00:00.000Z", 1L)
+            );
+        }
+    }
+
     private void testCase(
         IndexSearcher indexSearcher,
         Query query,
@@ -311,7 +413,199 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         assertEquals(defaultAggregation.getBuckets(), starTreeAggregation.getBuckets());
     }
 
+    /**
+     * Asserts that the default aggregation's non-empty buckets have the expected doc counts, by key, that a search serves the
+     * request from the star-tree, and that the star-tree gets the same non-empty buckets, with the same sub-aggregations. Empty
+     * buckets are not compared: the default aggregation can add empty buckets from the bounds of a range query on the
+     * histogram's field, or of hard bounds.
+     * <p>
+     * Whether the search serves the request from the star-tree is decided by {@link StarTreeQueryContext#consolidateAllFilters},
+     * which validates the request's query and aggregations. The star-tree context of searchAndReduceStarTree registers no
+     * aggregations, which skips that validation: it is run here, so that a star-tree that declines the request fails the test.
+     */
+    private void assertStarTreeMatchesDefault(
+        StarTreeSegment segment,
+        Query query,
+        QueryBuilder queryBuilder,
+        DateHistogramAggregationBuilder histogram,
+        Map<String, Long> expectedDocCounts
+    ) throws IOException {
+        InternalDateHistogram defaultHistogram = searchAndReduceStarTree(
+            createIndexSettings(),
+            segment.searcher(),
+            query,
+            queryBuilder,
+            histogram,
+            null,
+            null,
+            null,
+            DEFAULT_MAX_BUCKETS,
+            false,
+            null,
+            false,
+            TIMESTAMP_FIELD_TYPE,
+            NUMBER_FIELD_TYPE
+        );
+        assertEquals(expectedDocCounts, docCounts(nonEmpty(defaultHistogram)));
+        assertTrue("the star-tree must serve " + queryBuilder, searchUsesStarTree(segment, query, queryBuilder, histogram));
+
+        InternalDateHistogram starTreeHistogram = searchAndReduceStarTree(
+            createIndexSettings(),
+            segment.searcher(),
+            query,
+            queryBuilder,
+            histogram,
+            segment.starTree(),
+            segment.dimensions(),
+            null,
+            DEFAULT_MAX_BUCKETS,
+            false,
+            null,
+            false,
+            TIMESTAMP_FIELD_TYPE,
+            NUMBER_FIELD_TYPE
+        );
+        assertEquals(describe(nonEmpty(defaultHistogram)), describe(nonEmpty(starTreeHistogram)));
+        assertEquals(nonEmpty(defaultHistogram), nonEmpty(starTreeHistogram));
+    }
+
+    /**
+     * Whether a search serves the request from the star-tree: {@link StarTreeQueryContext#consolidateAllFilters} accepts the
+     * request's query and aggregations.
+     */
+    private boolean searchUsesStarTree(
+        StarTreeSegment segment,
+        Query query,
+        QueryBuilder queryBuilder,
+        DateHistogramAggregationBuilder histogram
+    ) throws IOException {
+        MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
+            DEFAULT_MAX_BUCKETS,
+            new NoneCircuitBreakerService().getBreaker(CircuitBreaker.REQUEST)
+        );
+        SearchContext searchContext = createSearchContextWithStarTreeContext(
+            segment.searcher(),
+            createIndexSettings(),
+            query,
+            queryBuilder,
+            segment.starTree(),
+            segment.dimensions(),
+            STAR_TREE_METRICS,
+            bucketConsumer,
+            null,
+            TIMESTAMP_FIELD_TYPE,
+            NUMBER_FIELD_TYPE
+        );
+        AggregatorFactories aggregations = AggregatorFactories.builder()
+            .addAggregator(histogram.rewrite(searchContext.getQueryShardContext()))
+            .build(searchContext.getQueryShardContext(), null);
+        when(searchContext.aggregations()).thenReturn(new SearchContextAggregations(aggregations, bucketConsumer));
+        return new StarTreeQueryContext(searchContext, queryBuilder).consolidateAllFilters(searchContext);
+    }
+
+    private static DateHistogramAggregationBuilder histogram(DateHistogramInterval interval) {
+        return dateHistogram("by_" + interval).field(TIMESTAMP_FIELD)
+            .calendarInterval(interval)
+            .subAggregation(sum("status_sum").field(FIELD_NAME));
+    }
+
+    private static Map<String, Long> docCounts(List<InternalDateHistogram.Bucket> buckets) {
+        Map<String, Long> docCounts = new LinkedHashMap<>();
+        buckets.forEach(bucket -> docCounts.put(bucket.getKeyAsString(), bucket.getDocCount()));
+        return docCounts;
+    }
+
+    // Buckets, readable in a failure message
+    private static List<String> describe(List<InternalDateHistogram.Bucket> buckets) {
+        return buckets.stream()
+            .map(bucket -> bucket.getKeyAsString() + ": " + bucket.getDocCount() + " docs, " + bucket.getAggregations().asList())
+            .toList();
+    }
+
+    private static long epochMillis(String date) {
+        return LocalDate.parse(date).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli();
+    }
+
+    /**
+     * A time window, from a UTC date to another, excluded
+     */
+    private record Window(String from, String to) {
+        Query query() {
+            return new IndexOrDocValuesQuery(
+                LongPoint.newRangeQuery(TIMESTAMP_FIELD, epochMillis(from), epochMillis(to) - 1),
+                SortedNumericDocValuesField.newSlowRangeQuery(TIMESTAMP_FIELD, epochMillis(from), epochMillis(to) - 1)
+            );
+        }
+
+        RangeQueryBuilder queryBuilder() {
+            return new RangeQueryBuilder(TIMESTAMP_FIELD).gte(epochMillis(from)).lt(epochMillis(to)).format("epoch_millis");
+        }
+    }
+
+    /**
+     * A single segment with a star-tree, and the star-tree's dimensions
+     */
+    private record StarTreeSegment(Directory directory, DirectoryReader reader, IndexSearcher searcher, CompositeIndexFieldInfo starTree,
+        LinkedHashMap<Dimension, MappedFieldType> dimensions) implements Closeable {
+        @Override
+        public void close() throws IOException {
+            IOUtils.close(reader, directory);
+        }
+    }
+
+    /**
+     * Indexes a document per timestamp, an ISO-8601 instant, into a single segment with a star-tree whose date dimension has the
+     * given calendar intervals. The n-th document has status n.
+     */
+    private StarTreeSegment indexStarTreeSegment(List<Rounding.DateTimeUnit> calendarIntervals, String... timestamps) throws IOException {
+        Directory directory = newDirectory();
+        IndexWriterConfig conf = newIndexWriterConfig(null);
+        conf.setCodec(getCodec(calendarIntervals));
+        conf.setMergePolicy(newLogMergePolicy());
+        try (RandomIndexWriter iw = new RandomIndexWriter(random(), directory, conf)) {
+            for (int i = 0; i < timestamps.length; i++) {
+                long timestamp = Instant.parse(timestamps[i]).toEpochMilli();
+                Document doc = new Document();
+                doc.add(new SortedNumericDocValuesField(FIELD_NAME, i + 1));
+                doc.add(new SortedNumericDocValuesField("size", 1));
+                doc.add(new SortedNumericDocValuesField(TIMESTAMP_FIELD, timestamp));
+                doc.add(new LongPoint(TIMESTAMP_FIELD, timestamp));
+                iw.addDocument(doc);
+            }
+            iw.forceMerge(1);
+        }
+        DirectoryReader reader = DirectoryReader.open(directory);
+        assertEquals(1, reader.leaves().size());
+        initValuesSourceRegistry();
+        SegmentReader segmentReader = Lucene.segmentReader(reader.leaves().get(0).reader());
+        CompositeIndexFieldInfo starTree = ((CompositeIndexReader) segmentReader.getDocValuesReader()).getCompositeIndexFields().get(0);
+
+        LinkedHashMap<Dimension, MappedFieldType> dimensions = new LinkedHashMap<>();
+        dimensions.put(
+            new NumericDimension(FIELD_NAME),
+            new NumberFieldMapper.NumberFieldType(FIELD_NAME, NumberFieldMapper.NumberType.INTEGER)
+        );
+        dimensions.put(new NumericDimension("size"), new NumberFieldMapper.NumberFieldType("size", NumberFieldMapper.NumberType.INTEGER));
+        dimensions.put(
+            new DateDimension(
+                TIMESTAMP_FIELD,
+                calendarIntervals.stream().<DateTimeUnitRounding>map(DateTimeUnitAdapter::new).toList(),
+                DateFieldMapper.Resolution.MILLISECONDS
+            ),
+            TIMESTAMP_FIELD_TYPE
+        );
+        return new StarTreeSegment(directory, reader, newSearcher(segmentReader, false, false), starTree, dimensions);
+    }
+
     public static XContentBuilder getExpandedMapping(int maxLeafDocs, boolean skipStarNodeCreationForStatusDimension) throws IOException {
+        return getExpandedMapping(maxLeafDocs, skipStarNodeCreationForStatusDimension, MONTH_AND_DAY);
+    }
+
+    private static XContentBuilder getExpandedMapping(
+        int maxLeafDocs,
+        boolean skipStarNodeCreationForStatusDimension,
+        List<Rounding.DateTimeUnit> calendarIntervals
+    ) throws IOException {
         return topMapping(b -> {
             b.startObject("composite");
             b.startObject("startree1"); // Use the same name as the provided mapping
@@ -333,8 +627,9 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
             b.startObject();
             b.field("name", TIMESTAMP_FIELD);
             b.startArray("calendar_intervals");
-            b.value("month");
-            b.value("day");
+            for (Rounding.DateTimeUnit calendarInterval : calendarIntervals) {
+                b.value(calendarInterval.shortName());
+            }
             b.endArray();
             b.endObject();
             b.endArray();

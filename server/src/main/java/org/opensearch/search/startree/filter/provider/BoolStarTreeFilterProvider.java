@@ -21,7 +21,6 @@ import org.opensearch.search.startree.filter.StarTreeFilter;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -124,37 +123,23 @@ public class BoolStarTreeFilterProvider implements StarTreeFilterProvider {
                         return null; // Unsupported field type
                     }
 
-                    // We have existing filters for this dimension
-                    if (newFilters.size() > 1) {
-                        // New filters are from SHOULD clause (multiple filters = OR condition)
-                        // Need to intersect each SHOULD filter with existing filters
-                        List<DimensionFilter> intersectedFilters = new ArrayList<>();
-                        for (DimensionFilter shouldFilter : newFilters) {
-                            for (DimensionFilter existingFilter : existingFilters) {
-                                DimensionFilter intersected = DimensionFilterMergerUtils.intersect(existingFilter, shouldFilter, mapper);
-                                if (intersected != null) {
-                                    intersectedFilters.add(intersected);
-                                }
+                    // Filters of one dimension are OR'd, on both sides (several come from a SHOULD clause):
+                    // intersect every existing filter with every new one, so that no alternative is dropped
+                    List<DimensionFilter> intersectedFilters = new ArrayList<>();
+                    for (DimensionFilter newFilter : newFilters) {
+                        for (DimensionFilter existingFilter : existingFilters) {
+                            DimensionFilter intersected = DimensionFilterMergerUtils.intersect(existingFilter, newFilter, mapper);
+                            if (intersected != null) {
+                                intersectedFilters.add(intersected);
                             }
                         }
-                        if (intersectedFilters.isEmpty()) {
-                            return null; // No valid intersections
-                        }
-                        dimensionToFilters.put(dimension, intersectedFilters);
-                    } else {
-                        // Here's where we need the DimensionFilter merging logic
-                        // For example: merging range with term, or range with range
-                        // And a single dimension filter coming from should clause is as good as must clause
-                        DimensionFilter mergedFilter = DimensionFilterMergerUtils.intersect(
-                            existingFilters.getFirst(),
-                            newFilters.getFirst(),
-                            mapper
-                        );
-                        if (mergedFilter == null) {
-                            return null; // No possible matches after merging
-                        }
-                        dimensionToFilters.put(dimension, Collections.singletonList(mergedFilter));
                     }
+                    if (intersectedFilters.isEmpty()) {
+                        return null; // No possible matches after merging
+                    }
+                    // Each intersection resolves on its own calendar interval, and the traversal reads a dimension's
+                    // filters on one interval: bring them to the finest, as for SHOULD clauses
+                    dimensionToFilters.put(dimension, mapper.getFinalDimensionFilters(intersectedFilters));
                 }
             }
         }
