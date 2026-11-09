@@ -51,7 +51,12 @@ public class StarTreeQueryHelper {
      * Checks if the search context can be supported by star-tree
      */
     public static boolean isStarTreeSupported(SearchContext context) {
-        return context.aggregations() != null && context.mapperService().isCompositeIndexPresent() && context.parsedPostFilter() == null;
+        return context.aggregations() != null && context.mapperService().isCompositeIndexPresent() && context.parsedPostFilter() == null
+        // The star-tree pre-computes whole segments: it cannot apply a minimum score, stop after a number of documents,
+        // or keep only one slice's documents
+            && context.minimumScore() == null
+            && context.terminateAfter() == SearchContext.DEFAULT_TERMINATE_AFTER
+            && (context.request() == null || context.request().source() == null || context.request().source().slice() == null);
     }
 
     public static CompositeIndexFieldInfo getSupportedStarTree(QueryShardContext context) {

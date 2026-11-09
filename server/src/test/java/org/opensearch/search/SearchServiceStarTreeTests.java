@@ -1125,6 +1125,49 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         }
     }
 
+    /** The star-tree pre-computes whole segments, so it must not answer requests that keep only some documents. */
+    public void testRequestsThatLimitDocumentsAreNotResolvedByTheStarTree() throws Exception {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(
+                StarTreeFilterTests.getExpandedMapping(
+                    1,
+                    false,
+                    StarTreeFilterTests.DIMENSION_TYPE_MAP,
+                    StarTreeFilterTests.METRIC_TYPE_MAP
+                )
+            );
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        assertTrue(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(max("max").field("field"))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).minScore(1f).aggregation(max("max").field("field"))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).terminateAfter(10).aggregation(max("max").field("field"))));
+    }
+
+    private boolean starTreeResolves(ShardSearchRequest request, SearchSourceBuilder source) throws IOException {
+        request.source(source);
+        SearchService searchService = getInstanceFromNode(SearchService.class);
+        try (
+            ReaderContext reader = searchService.createOrGetReaderContext(request, false);
+            SearchContext context = searchService.createContext(reader, request, null, true)
+        ) {
+            return context.getQueryShardContext().getStarTreeQueryContext() != null;
+        }
+    }
+
     private void setStarTreeIndexSetting(String value) {
         client().admin()
             .cluster()
