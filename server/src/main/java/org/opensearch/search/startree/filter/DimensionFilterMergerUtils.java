@@ -30,6 +30,11 @@ public class DimensionFilterMergerUtils {
             return null;
         }
 
+        // A filter that matches nothing (it has no dimension name) leaves nothing to intersect
+        if (filter1 instanceof MatchNoneFilter || filter2 instanceof MatchNoneFilter) {
+            return null;
+        }
+
         if (filter1.getDimensionName() == null || filter2.getDimensionName() == null) {
             throw new IllegalArgumentException("Cannot intersect filters with null dimension name");
         }

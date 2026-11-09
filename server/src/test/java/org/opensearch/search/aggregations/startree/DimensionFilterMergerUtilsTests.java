@@ -17,6 +17,7 @@ import org.opensearch.search.startree.StarTreeNodeCollector;
 import org.opensearch.search.startree.filter.DimensionFilter;
 import org.opensearch.search.startree.filter.DimensionFilterMergerUtils;
 import org.opensearch.search.startree.filter.ExactMatchDimFilter;
+import org.opensearch.search.startree.filter.MatchNoneFilter;
 import org.opensearch.search.startree.filter.RangeMatchDimFilter;
 import org.opensearch.search.startree.filter.provider.DimensionFilterMapper;
 import org.opensearch.test.OpenSearchTestCase;
@@ -42,6 +43,12 @@ public class DimensionFilterMergerUtilsTests extends OpenSearchTestCase {
             searchContext
         );
         keywordMapper = DimensionFilterMapper.Factory.fromMappedFieldType(new KeywordFieldMapper.KeywordFieldType("method"), searchContext);
+    }
+
+    public void testIntersectionWithAFilterThatMatchesNothingIsNull() {
+        DimensionFilter exact = new ExactMatchDimFilter("status", List.of(200L));
+        assertNull(DimensionFilterMergerUtils.intersect(new MatchNoneFilter(), exact, numericMapper));
+        assertNull(DimensionFilterMergerUtils.intersect(exact, new MatchNoneFilter(), numericMapper));
     }
 
     public void testRangeIntersection() {

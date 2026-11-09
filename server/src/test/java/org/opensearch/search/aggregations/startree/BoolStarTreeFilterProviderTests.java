@@ -1381,6 +1381,17 @@ public class BoolStarTreeFilterProviderTests extends OpenSearchTestCase {
         }
     }
 
+    public void testClauseThatMatchesNothingNextToAnotherOnTheSameDimensionReturnsNull() throws IOException {
+        // A range beyond the field type's bounds matches nothing; intersecting it used to fail the request
+        for (BoolQueryBuilder boolQuery : List.of(
+            new BoolQueryBuilder().filter(new TermQueryBuilder(STATUS, 200)).filter(new RangeQueryBuilder(STATUS).gt(Integer.MAX_VALUE)),
+            new BoolQueryBuilder().filter(new RangeQueryBuilder(STATUS).gt(Integer.MAX_VALUE)).filter(new TermQueryBuilder(STATUS, 200))
+        )) {
+            StarTreeFilterProvider provider = StarTreeFilterProvider.SingletonFactory.getProvider(boolQuery);
+            assertNull(boolQuery.toString(), provider.getFilter(searchContext, boolQuery, compositeFieldType));
+        }
+    }
+
     // Helper methods for assertions
     private void assertExactMatchValue(ExactMatchDimFilter filter, String expectedValue) {
         assertEquals(new BytesRef(expectedValue), filter.getRawValues().getFirst());

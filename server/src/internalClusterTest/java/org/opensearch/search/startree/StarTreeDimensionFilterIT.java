@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.IntStream;
 
 /**
  * Dimension filters bound to a segment must match exactly the documents the regular aggregation path matches:
@@ -112,6 +113,61 @@ public class StarTreeDimensionFilterIT extends OpenSearchIntegTestCase {
         assertCount(QueryBuilders.boolQuery().should(five).should(nothing), 20);
     }
 
+    /**
+     * Bool queries the star-tree must either answer exactly or leave to the regular path: a must_not next to a
+     * filter, OR'd alternatives narrowed by a later clause, and a clause that matches nothing next to another.
+     */
+    public void testBoolQueriesMatchTheRegularPath() throws Exception {
+        createStarTreeIndex();
+        BulkRequestBuilder bulk = client().prepareBulk(INDEX);
+        for (int i = 0; i < 60; i++) {
+            bulk.add(client().prepareIndex(INDEX).setSource("u", 1, "d1", BOOL_TERMS[i % 3], "n", i % 4, "m1", 1));
+        }
+        assertFalse(bulk.get().hasFailures());
+        refresh(INDEX);
+
+        long notExcluded = IntStream.range(0, 60).filter(i -> i % 3 == 0 && i % 4 != 0).count();
+        assertEquals(
+            notExcluded,
+            count(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("d1", "a")).mustNot(QueryBuilders.termQuery("n", 0)))
+        );
+        // "a", "b" or "c", narrowed to "a" or "b": dropping an alternative, ignoring the narrowing clause or adding it as
+        // another alternative counts 20 or 60 documents
+        long aOrB = IntStream.range(0, 60).filter(i -> i % 3 != 2).count();
+        QueryBuilder anyTerm = QueryBuilders.boolQuery()
+            .should(QueryBuilders.termQuery("d1", "a"))
+            .should(QueryBuilders.termQuery("d1", "b"))
+            .should(QueryBuilders.termQuery("d1", "c"));
+        QueryBuilder aOrBTerms = QueryBuilders.termsQuery("d1", "a", "b");
+        assertCount(QueryBuilders.boolQuery().filter(anyTerm).filter(aOrBTerms), aOrB);
+        assertCount(QueryBuilders.boolQuery().filter(aOrBTerms).filter(anyTerm), aOrB);
+        assertEquals(
+            0,
+            count(
+                QueryBuilders.boolQuery()
+                    .filter(QueryBuilders.termQuery("n", 1))
+                    .filter(QueryBuilders.rangeQuery("n").gt(Integer.MAX_VALUE))
+            )
+        );
+    }
+
+    private static final String[] BOOL_TERMS = { "a", "b", "c" };
+
+    /** The count, whichever path answers. */
+    private long count(QueryBuilder query) {
+        ValueCount count = client().prepareSearch(INDEX)
+            .setSize(0)
+            .setTrackTotalHits(false)
+            .setRequestCache(false)
+            .setQuery(query)
+            .addAggregation(AggregationBuilders.count("count").field("m1"))
+            .get()
+            .getAggregations()
+            .get("count");
+        return count.getValue();
+    }
+
+    /** Indexes {@code docsPerTerm} documents per term and refreshes, which writes one segment. */
     private void indexSegment(List<String> terms, int docsPerTerm) {
         BulkRequestBuilder bulk = client().prepareBulk(INDEX);
         for (String term : terms) {
