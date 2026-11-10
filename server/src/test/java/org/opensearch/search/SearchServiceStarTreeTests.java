@@ -55,6 +55,7 @@ import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
@@ -1724,6 +1725,42 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
             starTreeResolves(
                 request,
                 aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusWithScript)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
+
+    /**
+     * A multi_terms aggregation with include or exclude on one of its terms is not answered by the star-tree, which would
+     * return every combination: the request takes the regular path.
+     */
+    public void testMultiTermsWithIncludeExcludeAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip").build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig clientIpIncluded = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip")
+            .setIncludeExclude(new IncludeExclude(new String[] { "a" }, null))
+            .build();
+        MultiTermsValuesSourceConfig clientIpExcluded = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip")
+            .setIncludeExclude(new IncludeExclude(null, new String[] { "a" }))
+            .build();
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "include",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIpIncluded, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "exclude",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIpExcluded, status)).subAggregation(sum("sum").field(SIZE)))
             )
         );
     }
