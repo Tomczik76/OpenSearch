@@ -26,13 +26,16 @@ import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.Numbers;
+import org.opensearch.common.Rounding;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.network.InetAddresses;
+import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
 import org.opensearch.index.codec.composite.composite104.Composite104Codec;
 import org.opensearch.index.codec.composite912.datacube.startree.StarTreeDocValuesFormatTests;
+import org.opensearch.index.compositeindex.datacube.DateDimension;
 import org.opensearch.index.compositeindex.datacube.Dimension;
 import org.opensearch.index.compositeindex.datacube.Metric;
 import org.opensearch.index.compositeindex.datacube.MetricStat;
@@ -41,11 +44,13 @@ import org.opensearch.index.compositeindex.datacube.OrdinalDimension;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeField;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeFieldConfiguration;
 import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
+import org.opensearch.index.compositeindex.datacube.startree.utils.date.DateTimeUnitAdapter;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedSetStarTreeValuesIterator;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.StarTreeValuesIterator;
 import org.opensearch.index.document.SortedUnsignedLongDocValuesRangeQuery;
 import org.opensearch.index.mapper.CompositeDataCubeFieldType;
+import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.IpFieldMapper;
 import org.opensearch.index.mapper.KeywordFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -76,6 +81,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -662,5 +668,64 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
             when(mapperService.fieldType(fieldType.name())).thenReturn(fieldType);
         }
         return searchContext;
+    }
+
+    /**
+     * Without a {@code format}, the bounds of a date range are parsed with the field's mapped format, as on the regular path,
+     * not with the default format. A range written in the field's own format is answered, not declined or failed for not
+     * being in the default format; and with {@code strict_date_optional_time||epoch_second}, {@code 1704067200} is read as
+     * seconds, 2024-01-01, not as the milliseconds the default format would read it as, though that format parses it too.
+     */
+    public void testDateRangeWithoutAFormatIsParsedWithTheFieldsFormat() throws IOException {
+        CompositeDataCubeFieldType starTree = starTree(
+            starTreeField(
+                new DateDimension(
+                    "@timestamp",
+                    List.of(new DateTimeUnitAdapter(Rounding.DateTimeUnit.HOUR_OF_DAY)),
+                    DateFieldMapper.Resolution.MILLISECONDS
+                )
+            )
+        );
+        long from = Instant.parse("2024-01-01T00:00:00Z").toEpochMilli();
+        long to = Instant.parse("2024-01-02T00:00:00Z").toEpochMilli() - 1;
+        // The field's format and a range from 2024-01-01 to 2024-01-02 written in it
+        Map<String, RangeQueryBuilder> rangeQueries = new LinkedHashMap<>();
+        rangeQueries.put("yyyy-MM-dd HH:mm:ss", new RangeQueryBuilder("@timestamp").gte("2024-01-01 00:00:00").lt("2024-01-02 00:00:00"));
+        rangeQueries.put("strict_date_optional_time||epoch_second", new RangeQueryBuilder("@timestamp").gte("1704067200").lt("1704153600"));
+        for (Map.Entry<String, RangeQueryBuilder> formatAndRange : rangeQueries.entrySet()) {
+            // Doc values only, so that the regular path's query is a plain range over its inclusive bounds
+            DateFieldMapper.DateFieldType fieldType = new DateFieldMapper.DateFieldType(
+                "@timestamp",
+                false,
+                false,
+                true,
+                DateFormatter.forPattern(formatAndRange.getKey()),
+                DateFieldMapper.Resolution.MILLISECONDS,
+                null,
+                Collections.emptyMap()
+            );
+            SearchContext searchContext = searchContext(fieldType);
+            MapperService mapperService = searchContext.mapperService();
+            when(mapperService.getCompositeFieldTypes()).thenReturn(Set.of(starTree));
+            QueryShardContext queryShardContext = mock(QueryShardContext.class);
+            when(searchContext.getQueryShardContext()).thenReturn(queryShardContext);
+            RangeQueryBuilder rangeQuery = formatAndRange.getValue();
+
+            Query regular = fieldType.rangeQuery(
+                rangeQuery.from(),
+                rangeQuery.to(),
+                rangeQuery.includeLower(),
+                rangeQuery.includeUpper(),
+                null,
+                null,
+                null,
+                queryShardContext
+            );
+            assertEquals(formatAndRange.getKey(), SortedNumericDocValuesField.newSlowRangeQuery("@timestamp", from, to), regular);
+            StarTreeFilter filter = starTreeFilter(searchContext, rangeQuery, starTree);
+            assertNotNull(formatAndRange.getKey(), filter);
+            RangeMatchDimFilter window = (RangeMatchDimFilter) filter.getFiltersForDimension("@timestamp").getFirst();
+            assertEquals(formatAndRange.getKey(), regular, docValuesRangeQuery("@timestamp", window));
+        }
     }
 }

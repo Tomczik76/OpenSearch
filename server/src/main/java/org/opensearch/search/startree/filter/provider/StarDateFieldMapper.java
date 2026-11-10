@@ -62,10 +62,10 @@ class StarDateFieldMapper implements DimensionFilterMapper {
         String field = rangeQuery.fieldName();
         assert Objects.equals(dateDimension.getField(), rangeQuery.fieldName());
 
-        // Convert format string to DateMathParser if provided
+        // As on the regular path, the bounds are parsed with the query's format if it has one, else with the field's
         DateMathParser forcedDateParser = rangeQuery.format() != null
             ? DateFormatter.forPattern(rangeQuery.format()).toDateMathParser()
-            : org.opensearch.index.mapper.DateFieldMapper.getDefaultDateTimeFormatter().toDateMathParser();
+            : dateFieldType.dateTimeFormatter().toDateMathParser();
 
         ZoneId timeZone = rangeQuery.timeZone() != null ? ZoneId.of(rangeQuery.timeZone()) : null;
 
