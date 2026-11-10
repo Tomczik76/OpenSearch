@@ -560,6 +560,34 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
     }
 
     /**
+     * A term on an IP dimension can be a CIDR block, which the regular path matches as a prefix of addresses. The star-tree
+     * declines a term or terms query holding a block, also when other terms are plain addresses, rather than parse the block
+     * as one address and fail the request or match only that address. A query of plain addresses is still answered.
+     */
+    public void testIpCidrTermIsDeclined() throws IOException {
+        IpFieldMapper.IpFieldType fieldType = new IpFieldMapper.IpFieldType("ip");
+        // An IPv6 block: were it parsed as an address, an IPv4 block would be looked up as a host name
+        String block = "2001:db8::/32";
+        String address = "2001:db8::1";
+        assertNotNull(fieldType.termQuery(block, null));
+        SearchContext searchContext = searchContext(fieldType);
+        CompositeDataCubeFieldType starTree = starTree(starTreeField(new OrdinalDimension("ip")));
+
+        for (QueryBuilder query : List.of(
+            new TermQueryBuilder("ip", block),
+            new TermsQueryBuilder("ip", block),
+            new TermsQueryBuilder("ip", address, block)
+        )) {
+            assertNull(query.toString(), starTreeFilter(searchContext, query, starTree));
+        }
+        for (QueryBuilder query : List.of(new TermQueryBuilder("ip", address), new TermsQueryBuilder("ip", address))) {
+            StarTreeFilter filter = starTreeFilter(searchContext, query, starTree);
+            assertNotNull(query.toString(), filter);
+            assertEquals(Set.of("ip"), filter.getDimensions());
+        }
+    }
+
+    /**
      * The values from 4 to 8 that the star-tree matches for {@code query} on the one numeric dimension of {@code starTreeField}.
      * A query the provider declines runs on the regular path, which matches {@code regularPath}.
      */

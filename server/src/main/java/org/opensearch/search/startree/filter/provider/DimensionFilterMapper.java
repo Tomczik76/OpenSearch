@@ -531,6 +531,16 @@ class KeywordFieldMapper extends OrdinalFieldMapper {
  */
 class IpFieldMapper extends OrdinalFieldMapper {
 
+    @Override
+    public DimensionFilter getExactMatchFilter(MappedFieldType mappedFieldType, List<Object> rawValues) {
+        for (Object rawValue : rawValues) {
+            if (rawValue instanceof String s && s.contains("/")) {
+                return null; // A CIDR block matches a prefix of addresses, not one address: the regular path answers it
+            }
+        }
+        return super.getExactMatchFilter(mappedFieldType, rawValues);
+    }
+
     /**
      * Parses a raw IP address value into a sortable {@link BytesRef}.
      *
