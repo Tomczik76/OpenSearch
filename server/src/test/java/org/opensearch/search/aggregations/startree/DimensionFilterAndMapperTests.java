@@ -31,6 +31,7 @@ import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
 import org.opensearch.index.codec.composite.composite104.Composite104Codec;
@@ -81,6 +82,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -91,6 +93,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+
+import org.roaringbitmap.RoaringBitmap;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -865,5 +869,29 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
             starTreePath.add(starTreeRangeQuery(fieldType, starTreeFilter(searchContext, rangeQuery, starTree), regular));
         }
         assertEquals(regularPath, starTreePath);
+    }
+
+    /**
+     * A terms query whose {@code value_type} is {@code bitmap} holds one serialized bitmap of the values to match, not the
+     * values. The star-tree does not parse the bitmap as a number and fail the request: it declines the query, which the
+     * regular path answers, or matches the values of the bitmap.
+     */
+    public void testBitmapTermsQueryDoesNotFail() throws IOException {
+        RoaringBitmap bitmap = RoaringBitmap.bitmapOf(5, 7);
+        byte[] serialized = new byte[bitmap.serializedSizeInBytes()];
+        bitmap.serialize(ByteBuffer.wrap(serialized));
+        BytesArray bitmapArray = new BytesArray(serialized);
+        NumberFieldMapper.NumberFieldType fieldType = new NumberFieldMapper.NumberFieldType(
+            "integer",
+            NumberFieldMapper.NumberType.INTEGER
+        );
+        assertNotNull(fieldType.bitmapQuery(bitmapArray));
+        SearchContext searchContext = searchContext(fieldType);
+        StarTreeField starTreeField = starTreeField(new NumericDimension(fieldType.name()));
+
+        TermsQueryBuilder query = new TermsQueryBuilder(fieldType.name(), List.of(bitmapArray)).valueType(
+            TermsQueryBuilder.ValueType.BITMAP
+        );
+        assertEquals(Set.of(5L, 7L), matchedValues(query, Set.of(5L, 7L), searchContext, starTreeField));
     }
 }
