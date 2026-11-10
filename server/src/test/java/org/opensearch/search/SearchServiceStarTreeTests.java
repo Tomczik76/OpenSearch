@@ -1157,6 +1157,46 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).terminateAfter(10).aggregation(max("max").field("field"))));
     }
 
+    /**
+     * The star-tree stores the date dimension only as its calendar-interval sub-dimensions, which cannot give a term per
+     * timestamp: it must not resolve a terms or multi_terms aggregation on the date field, and still resolves them on other
+     * dimensions.
+     */
+    public void testTermsOnTheDateFieldAreNotResolvedByTheStarTree() throws Exception {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(DateHistogramAggregatorTests.getExpandedMapping(1, false));
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        assertTrue(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(termsWithMax(STATUS))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(termsWithMax(TIMESTAMP_FIELD))));
+        assertTrue(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(multiTermsWithMax(STATUS, SIZE))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(multiTermsWithMax(TIMESTAMP_FIELD, STATUS))));
+    }
+
+    private static TermsAggregationBuilder termsWithMax(String field) {
+        return terms("terms").field(field).subAggregation(max("max").field(STATUS));
+    }
+
+    private static MultiTermsAggregationBuilder multiTermsWithMax(String... fields) {
+        return multiTerms("multi_terms").terms(
+            Arrays.stream(fields).map(field -> new MultiTermsValuesSourceConfig.Builder().setFieldName(field).build()).toList()
+        ).subAggregation(max("max").field(STATUS));
+    }
+
     private boolean starTreeResolves(ShardSearchRequest request, SearchSourceBuilder source) throws IOException {
         request.source(source);
         SearchService searchService = getInstanceFromNode(SearchService.class);

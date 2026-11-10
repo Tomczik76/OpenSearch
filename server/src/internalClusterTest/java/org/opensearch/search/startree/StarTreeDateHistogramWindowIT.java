@@ -13,19 +13,24 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.aggregations.Aggregations;
+import org.opensearch.search.aggregations.bucket.MultiBucketsAggregation;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.Histogram;
+import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.Terms;
 import org.opensearch.search.aggregations.metrics.Sum;
+import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.time.Instant;
 import java.time.ZonedDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.function.IntFunction;
@@ -113,6 +118,61 @@ public class StarTreeDateHistogramWindowIT extends OpenSearchIntegTestCase {
                 readHistogram(serviceBucket.getAggregations(), serviceBucket.getKeyAsString() + "@", actual);
             }
             assertBuckets("terms > hourly histogram, profile " + profile, expected, actual);
+        }
+    }
+
+    /**
+     * The star-tree stores the date only as its calendar-interval sub-dimensions, so it cannot answer a terms aggregation
+     * on the raw date field: such a request must take the regular path and return every timestamp's bucket, also for a
+     * timestamp that is on no hour's boundary.
+     */
+    public void testTermsOnTheDateFieldMatchesTheRegularPath() throws Exception {
+        createStarTreeIndexWithDocuments();
+        long unaligned = T0 + 10 * HOUR + 17 * 60_000L; // 10:17
+        assertEquals(
+            RestStatus.CREATED,
+            client().prepareIndex(INDEX).setSource("@timestamp", unaligned, "service", "A", "value", 5).get().status()
+        );
+        refresh(INDEX);
+        Map<Long, long[]> expected = new TreeMap<>();
+        expected.put(unaligned, new long[] { 1, 5 });
+        for (int j = 0; j < DOCS; j++) {
+            long[] countAndSum = expected.computeIfAbsent(timestamp(j), k -> new long[2]);
+            countAndSum[0]++;
+            countAndSum[1] += value(j);
+        }
+        List<AggregationBuilder> aggregations = List.of(
+            AggregationBuilders.terms("by").field("@timestamp").size(100).subAggregation(AggregationBuilders.sum("total").field("value")),
+            new MultiTermsAggregationBuilder("by").terms(
+                List.of(
+                    new MultiTermsValuesSourceConfig.Builder().setFieldName("@timestamp").build(),
+                    new MultiTermsValuesSourceConfig.Builder().setFieldName("service").build()
+                )
+            ).size(200).subAggregation(AggregationBuilders.sum("total").field("value"))
+        );
+        for (AggregationBuilder aggregation : aggregations) {
+            long starTreeBefore = starTreeQueries();
+            SearchResponse response = client().prepareSearch(INDEX)
+                .setSize(0)
+                .setTrackTotalHits(false)
+                .setRequestCache(false)
+                .addAggregation(aggregation)
+                .get();
+            assertEquals(aggregation.getType() + ": failed shards", 0, response.getFailedShards());
+            assertEquals(aggregation.getType() + ": requests the star-tree answered", starTreeBefore, starTreeQueries());
+            Map<Long, long[]> actual = new TreeMap<>();
+            for (MultiBucketsAggregation.Bucket bucket : ((MultiBucketsAggregation) response.getAggregations().get("by")).getBuckets()) {
+                // terms gives the epoch millis, multi_terms the formatted date
+                Object first = bucket.getKey() instanceof List<?> keys ? keys.getFirst() : bucket.getKey();
+                long key = first instanceof Number number ? number.longValue() : Instant.parse(first.toString()).toEpochMilli();
+                long[] countAndSum = actual.computeIfAbsent(key, k -> new long[2]);
+                countAndSum[0] += bucket.getDocCount();
+                countAndSum[1] += (long) ((Sum) bucket.getAggregations().get("total")).getValue();
+            }
+            assertEquals(aggregation.getType() + ": keys", expected.keySet(), actual.keySet());
+            for (Map.Entry<Long, long[]> entry : expected.entrySet()) {
+                assertArrayEquals(aggregation.getType() + ": bucket " + entry.getKey(), entry.getValue(), actual.get(entry.getKey()));
+            }
         }
     }
 

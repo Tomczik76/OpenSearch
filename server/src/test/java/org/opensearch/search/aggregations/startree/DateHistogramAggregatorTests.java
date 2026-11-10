@@ -58,14 +58,18 @@ import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
+import org.opensearch.search.aggregations.bucket.MultiBucketsAggregation;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.terms.InternalTerms;
+import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
+import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.profile.Profilers;
@@ -89,6 +93,7 @@ import static org.opensearch.search.aggregations.AggregationBuilders.count;
 import static org.opensearch.search.aggregations.AggregationBuilders.dateHistogram;
 import static org.opensearch.search.aggregations.AggregationBuilders.max;
 import static org.opensearch.search.aggregations.AggregationBuilders.min;
+import static org.opensearch.search.aggregations.AggregationBuilders.multiTerms;
 import static org.opensearch.search.aggregations.AggregationBuilders.sum;
 import static org.opensearch.search.aggregations.AggregationBuilders.terms;
 import static org.opensearch.test.InternalAggregationTestCase.DEFAULT_MAX_BUCKETS;
@@ -415,6 +420,79 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         } finally {
             profile = false;
         }
+    }
+
+    /**
+     * The star-tree stores the date dimension only as its calendar-interval sub-dimensions, which cannot give a term per
+     * timestamp: a terms or multi_terms aggregation on the date field must not be served from the star-tree, and gets a bucket
+     * per timestamp, also for a timestamp on no interval's boundary. The star-tree used to serve it, and fail the request: the
+     * segment has no dimension of the field's name.
+     */
+    public void testTermsOnTheDateFieldAreNotServedByTheStarTree() throws IOException {
+        Query query = new MatchAllDocsQuery();
+        TermsAggregationBuilder byTimestamp = terms("by_timestamp").field(TIMESTAMP_FIELD)
+            .subAggregation(sum("status_sum").field(FIELD_NAME));
+        MultiTermsAggregationBuilder byTimestampAndSize = multiTerms("by_timestamp_and_size").terms(
+            List.of(
+                new MultiTermsValuesSourceConfig.Builder().setFieldName(TIMESTAMP_FIELD).build(),
+                new MultiTermsValuesSourceConfig.Builder().setFieldName("size").build()
+            )
+        ).subAggregation(sum("status_sum").field(FIELD_NAME));
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                MONTH_AND_DAY,
+                "1970-01-05T00:00:00Z",
+                "1970-01-05T10:17:00Z",
+                "1970-01-05T10:17:00Z",
+                "1970-02-01T00:00:00Z"
+            )
+        ) {
+            // Terms on another dimension are served from the star-tree
+            TermsAggregationBuilder bySize = terms("by_size").field("size").subAggregation(sum("status_sum").field(FIELD_NAME));
+            assertTrue("the star-tree must serve " + bySize, searchUsesStarTree(segment, query, null, bySize));
+
+            assertEquals(
+                Map.of("1970-01-05T00:00:00.000Z", 1L, "1970-01-05T10:17:00.000Z", 2L, "1970-02-01T00:00:00.000Z", 1L),
+                docCounts((MultiBucketsAggregation) search(segment, query, byTimestamp))
+            );
+            assertEquals(
+                Map.of("1970-01-05T00:00:00.000Z|1", 1L, "1970-01-05T10:17:00.000Z|1", 2L, "1970-02-01T00:00:00.000Z|1", 1L),
+                docCounts((MultiBucketsAggregation) search(segment, query, byTimestampAndSize))
+            );
+            assertFalse("the star-tree must not serve " + byTimestamp, searchUsesStarTree(segment, query, null, byTimestamp));
+            assertFalse("the star-tree must not serve " + byTimestampAndSize, searchUsesStarTree(segment, query, null, byTimestampAndSize));
+        }
+    }
+
+    /**
+     * Searches as a search does: from the star-tree if {@link StarTreeQueryContext#consolidateAllFilters} accepts the request,
+     * else from the documents.
+     */
+    private InternalAggregation search(StarTreeSegment segment, Query query, AggregationBuilder aggregation) throws IOException {
+        boolean starTree = searchUsesStarTree(segment, query, null, aggregation);
+        return searchAndReduceStarTree(
+            createIndexSettings(),
+            segment.searcher(),
+            query,
+            null,
+            aggregation,
+            starTree ? segment.starTree() : null,
+            starTree ? segment.dimensions() : null,
+            null,
+            DEFAULT_MAX_BUCKETS,
+            false,
+            null,
+            starTree,
+            TIMESTAMP_FIELD_TYPE,
+            NUMBER_FIELD_TYPE,
+            SIZE_FIELD_TYPE
+        );
+    }
+
+    private static Map<String, Long> docCounts(MultiBucketsAggregation aggregation) {
+        Map<String, Long> docCounts = new LinkedHashMap<>();
+        aggregation.getBuckets().forEach(bucket -> docCounts.put(bucket.getKeyAsString(), bucket.getDocCount()));
+        return docCounts;
     }
 
     // Terms buckets, each with the non-empty buckets of its date histogram, readable in a failure message

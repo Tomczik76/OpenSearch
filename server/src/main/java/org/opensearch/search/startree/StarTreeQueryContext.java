@@ -156,9 +156,11 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         TermsAggregatorFactory termsAggregatorFactory
     ) {
-        // Validate request field is part of dimensions
+        // Validate request field is part of dimensions. The date dimension is stored only as its calendar-interval
+        // sub-dimensions, which cannot give a term per timestamp
         return compositeIndexFieldInfo.getDimensions()
             .stream()
+            .filter(dimension -> dimension instanceof DateDimension == false)
             .map(Dimension::getField)
             .anyMatch(termsAggregatorFactory.getField()::equals);
     }
@@ -233,8 +235,10 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         MultiTermsAggregationFactory multiTermsAggregationFactory
     ) {
+        // The date dimension is stored only as its calendar-interval sub-dimensions, as for terms
         return compositeIndexFieldInfo.getDimensions()
             .stream()
+            .filter(dimension -> dimension instanceof DateDimension == false)
             .map(Dimension::getField)
             .collect(Collectors.toSet())
             .containsAll(multiTermsAggregationFactory.getRequestFields());
