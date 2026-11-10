@@ -45,6 +45,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.terms.InternalMultiTerms;
 import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
@@ -196,6 +197,36 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
                     new MatchAllDocsQuery(),
                     null,
                     new MultiTermsAggregationBuilder("_name").terms(getSourceConfig(KEYWORD_FIELD, INT_FIELD))
+                        .subAggregation(max("max_metric").field(METRIC_FIELD)),
+                    getStarTree(reader),
+                    getSupportedDimensions()
+                );
+            }
+        }
+    }
+
+    /**
+     * multi_terms with {@code collect_mode: breadth_first} and a sub-aggregation is answered by the star-tree: the
+     * star-tree pre-computes the sub-aggregations with their buckets, so they are not deferred.
+     */
+    public void testBreadthFirstWithSubAggregation() throws IOException {
+        try (Directory directory = newDirectory()) {
+            IndexWriterConfig conf = new IndexWriterConfig();
+            conf.setCodec(getCodec());
+            try (IndexWriter iw = new IndexWriter(directory, conf)) {
+                iw.addDocument(doc("a", 1, 10.0f, 100.0));
+                iw.addDocument(doc("a", 2, 20.0f, 200.0));
+                iw.addDocument(doc("b", 1, 10.0f, 300.0));
+                iw.addDocument(doc("b", 1, 10.0f, 400.0));
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                assertEquals(1, reader.leaves().size());
+                testCase(
+                    newSearcher(wrapInMockESDirectoryReader(reader), false, false),
+                    new MatchAllDocsQuery(),
+                    null,
+                    new MultiTermsAggregationBuilder("_name").terms(getSourceConfig(KEYWORD_FIELD, INT_FIELD))
+                        .collectMode(Aggregator.SubAggCollectionMode.BREADTH_FIRST)
                         .subAggregation(max("max_metric").field(METRIC_FIELD)),
                     getStarTree(reader),
                     getSupportedDimensions()

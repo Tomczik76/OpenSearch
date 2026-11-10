@@ -575,7 +575,10 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
 
     @Override
     protected boolean shouldDefer(Aggregator aggregator) {
-        return collectMode == Aggregator.SubAggCollectionMode.BREADTH_FIRST && !aggsUsedForSorting.contains(aggregator);
+        // The star-tree pre-computes the sub-aggregations with their buckets, as the terms aggregation does
+        return context.getQueryShardContext().getStarTreeQueryContext() == null
+            && collectMode == Aggregator.SubAggCollectionMode.BREADTH_FIRST
+            && !aggsUsedForSorting.contains(aggregator);
     }
 
     private void collectZeroDocEntriesIfNeeded(long owningBucketOrd) throws IOException {
