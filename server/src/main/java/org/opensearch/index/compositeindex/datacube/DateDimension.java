@@ -179,12 +179,19 @@ public class DateDimension implements Dimension {
         // Find the largest interval that is less than or equal to search interval
         for (DateTimeUnitRounding interval : sortedCalendarIntervals) {
             if (comparator.compare(interval, searchInterval) <= 0) {
-                closestValidInterval = interval;
+                // Weeks do not nest in months, quarters or years: only a week interval is searched on weeks
+                if (isWeek(interval) == false || isWeek(searchInterval)) {
+                    closestValidInterval = interval;
+                }
             } else {
                 break;
             }
         }
         return closestValidInterval;
+    }
+
+    private static boolean isWeek(DateTimeUnitRounding interval) {
+        return Rounding.DateTimeUnit.WEEK_OF_WEEKYEAR.shortName().equals(interval.shortName());
     }
 
     /**

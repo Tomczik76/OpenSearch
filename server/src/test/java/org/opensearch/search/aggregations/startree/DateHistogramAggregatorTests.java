@@ -530,6 +530,191 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
         );
     }
 
+    /**
+     * The intersection of a month-aligned and a week-aligned date window matches the default aggregation. Its month-aligned
+     * bound is not week-aligned, so the star-tree reads it on the day interval, not on the week one: comparing week-rounded
+     * timestamps with that bound would count the documents of the week that straddles it.
+     */
+    public void testMonthWindowNarrowedByWeekWindow() throws IOException {
+        // On the star-tree's intervals, January resolves on month, the weeks from Monday January 8th to Monday March 4th on week
+        Window january = new Window("2024-01-01", "2024-02-01");
+        Window weeks = new Window("2024-01-08", "2024-03-04");
+        Query query = new BooleanQuery.Builder().add(january.query(), BooleanClause.Occur.FILTER)
+            .add(weeks.query(), BooleanClause.Occur.FILTER)
+            .build();
+        QueryBuilder queryBuilder = new BoolQueryBuilder().filter(january.queryBuilder()).filter(weeks.queryBuilder());
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                List.of(Rounding.DateTimeUnit.DAY_OF_MONTH, Rounding.DateTimeUnit.WEEK_OF_WEEKYEAR, Rounding.DateTimeUnit.MONTH_OF_YEAR),
+                "2024-01-05T12:00:00Z",
+                "2024-01-10T12:00:00Z",
+                "2024-01-30T12:00:00Z",
+                // In the week of January 29th
+                "2024-02-02T12:00:00Z",
+                "2024-03-10T12:00:00Z"
+            )
+        ) {
+            assertTrue(searchUsesStarTree(segment, query, queryBuilder, histogram(DateHistogramInterval.MONTH)));
+            assertStarTreeMatchesDefault(
+                segment,
+                query,
+                queryBuilder,
+                histogram(DateHistogramInterval.MONTH),
+                Map.of("2024-01-01T00:00:00.000Z", 2L)
+            );
+            assertStarTreeMatchesDefault(
+                segment,
+                query,
+                queryBuilder,
+                histogram(DateHistogramInterval.DAY),
+                Map.of("2024-01-10T00:00:00.000Z", 1L, "2024-01-30T00:00:00.000Z", 1L)
+            );
+        }
+    }
+
+    /**
+     * As {@link #testMonthWindowNarrowedByWeekWindow}, with the windows OR'd: the star-tree answers the query, and matches the
+     * default aggregation. The month window's upper bound is not week-aligned, so the star-tree reads both windows on the day
+     * interval, not on the week one of the finer window: comparing week-rounded timestamps with that bound would count the
+     * documents of the week that straddles it.
+     */
+    public void testMonthWindowOrWeekWindow() throws IOException {
+        // On the star-tree's intervals, January resolves on month, the weeks from Monday February 12th to Monday 26th on week
+        Window january = new Window("2024-01-01", "2024-02-01");
+        Window weeks = new Window("2024-02-12", "2024-02-26");
+        Query query = new BooleanQuery.Builder().add(january.query(), BooleanClause.Occur.SHOULD)
+            .add(weeks.query(), BooleanClause.Occur.SHOULD)
+            .build();
+        QueryBuilder queryBuilder = new BoolQueryBuilder().should(january.queryBuilder()).should(weeks.queryBuilder());
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                List.of(Rounding.DateTimeUnit.DAY_OF_MONTH, Rounding.DateTimeUnit.WEEK_OF_WEEKYEAR, Rounding.DateTimeUnit.MONTH_OF_YEAR),
+                "2023-12-31T12:00:00Z",
+                "2024-01-10T12:00:00Z",
+                "2024-01-30T12:00:00Z",
+                // In the week of January 29th
+                "2024-02-02T12:00:00Z",
+                "2024-02-07T12:00:00Z",
+                "2024-02-14T12:00:00Z",
+                "2024-02-27T12:00:00Z"
+            )
+        ) {
+            assertTrue(searchUsesStarTree(segment, query, queryBuilder, histogram(DateHistogramInterval.MONTH)));
+            assertStarTreeMatchesDefault(
+                segment,
+                query,
+                queryBuilder,
+                histogram(DateHistogramInterval.MONTH),
+                Map.of("2024-01-01T00:00:00.000Z", 2L, "2024-02-01T00:00:00.000Z", 1L)
+            );
+            assertStarTreeMatchesDefault(
+                segment,
+                query,
+                queryBuilder,
+                histogram(DateHistogramInterval.DAY),
+                Map.of("2024-01-10T00:00:00.000Z", 1L, "2024-01-30T00:00:00.000Z", 1L, "2024-02-14T00:00:00.000Z", 1L)
+            );
+        }
+    }
+
+    /**
+     * On a star-tree with week and month intervals and no day, the intersection or the union of a month-aligned and a
+     * week-aligned window matches the default aggregation: no interval of the star-tree resolves the month-aligned bound that
+     * is not week-aligned, so the star-tree declines the query, though it answers either window alone.
+     */
+    public void testMonthAndWeekWindowsWithoutADayIntervalAreDeclined() throws IOException {
+        Window january = new Window("2024-01-01", "2024-02-01");
+        Window weeks = new Window("2024-01-08", "2024-03-04");
+        Query intersection = new BooleanQuery.Builder().add(january.query(), BooleanClause.Occur.FILTER)
+            .add(weeks.query(), BooleanClause.Occur.FILTER)
+            .build();
+        QueryBuilder intersectionBuilder = new BoolQueryBuilder().filter(january.queryBuilder()).filter(weeks.queryBuilder());
+        Query union = new BooleanQuery.Builder().add(january.query(), BooleanClause.Occur.SHOULD)
+            .add(weeks.query(), BooleanClause.Occur.SHOULD)
+            .build();
+        QueryBuilder unionBuilder = new BoolQueryBuilder().should(january.queryBuilder()).should(weeks.queryBuilder());
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                List.of(Rounding.DateTimeUnit.WEEK_OF_WEEKYEAR, Rounding.DateTimeUnit.MONTH_OF_YEAR),
+                "2024-01-05T12:00:00Z",
+                "2024-01-10T12:00:00Z",
+                "2024-01-30T12:00:00Z",
+                // In the week of January 29th
+                "2024-02-02T12:00:00Z",
+                "2024-03-10T12:00:00Z"
+            )
+        ) {
+            DateHistogramAggregationBuilder months = histogram(DateHistogramInterval.MONTH);
+            assertTrue("january", searchUsesStarTree(segment, january.query(), january.queryBuilder(), months));
+            assertTrue("weeks", searchUsesStarTree(segment, weeks.query(), weeks.queryBuilder(), months));
+            assertStarTreeDeclines(segment, intersection, intersectionBuilder, months, Map.of("2024-01-01T00:00:00.000Z", 2L));
+            assertStarTreeDeclines(
+                segment,
+                union,
+                unionBuilder,
+                months,
+                Map.of("2024-01-01T00:00:00.000Z", 3L, "2024-02-01T00:00:00.000Z", 1L)
+            );
+        }
+    }
+
+    /**
+     * On a star-tree with day and week intervals, a month, quarter or year date_histogram matches the default aggregation. Weeks
+     * do not nest in months, so the star-tree computes it from the day interval: on the week interval, a week that straddles two
+     * months would be bucketed whole in the first one.
+     */
+    public void testMonthQuarterAndYearHistogramsOnWeekInterval() throws IOException {
+        // The weeks of January 29th and December 30th 2024 straddle two months, the second also two quarters and two years
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                List.of(Rounding.DateTimeUnit.DAY_OF_MONTH, Rounding.DateTimeUnit.WEEK_OF_WEEKYEAR),
+                "2024-01-15T12:00:00Z",
+                "2024-01-30T12:00:00Z",
+                "2024-02-02T12:00:00Z",
+                "2024-12-31T12:00:00Z",
+                "2025-01-02T12:00:00Z"
+            )
+        ) {
+            for (DateHistogramInterval interval : List.of(
+                DateHistogramInterval.MONTH,
+                DateHistogramInterval.QUARTER,
+                DateHistogramInterval.YEAR
+            )) {
+                assertTrue(interval.toString(), searchUsesStarTree(segment, new MatchAllDocsQuery(), null, histogram(interval)));
+            }
+            assertStarTreeMatchesDefault(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                histogram(DateHistogramInterval.MONTH),
+                Map.of(
+                    "2024-01-01T00:00:00.000Z",
+                    2L,
+                    "2024-02-01T00:00:00.000Z",
+                    1L,
+                    "2024-12-01T00:00:00.000Z",
+                    1L,
+                    "2025-01-01T00:00:00.000Z",
+                    1L
+                )
+            );
+            assertStarTreeMatchesDefault(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                histogram(DateHistogramInterval.QUARTER),
+                Map.of("2024-01-01T00:00:00.000Z", 3L, "2024-10-01T00:00:00.000Z", 1L, "2025-01-01T00:00:00.000Z", 1L)
+            );
+            assertStarTreeMatchesDefault(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                histogram(DateHistogramInterval.YEAR),
+                Map.of("2024-01-01T00:00:00.000Z", 4L, "2025-01-01T00:00:00.000Z", 1L)
+            );
+        }
+    }
+
     private void testCase(
         IndexSearcher indexSearcher,
         Query query,
