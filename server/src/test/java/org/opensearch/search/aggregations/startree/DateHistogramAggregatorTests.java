@@ -79,6 +79,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -605,6 +606,37 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
      * which validates the request's query and aggregations. The star-tree context of searchAndReduceStarTree registers no
      * aggregations, which skips that validation: it is run here, so that a star-tree that declines the request fails the test.
      */
+    /**
+     * Asserts the default aggregation's buckets for the request, and that the star-tree declines it: the regular path
+     * answers it.
+     */
+    private void assertStarTreeDeclines(
+        StarTreeSegment segment,
+        Query query,
+        QueryBuilder queryBuilder,
+        DateHistogramAggregationBuilder histogram,
+        Map<String, Long> expectedDocCounts
+    ) throws IOException {
+        InternalDateHistogram defaultHistogram = searchAndReduceStarTree(
+            createIndexSettings(),
+            segment.searcher(),
+            query,
+            queryBuilder,
+            histogram,
+            null,
+            null,
+            null,
+            DEFAULT_MAX_BUCKETS,
+            false,
+            null,
+            false,
+            TIMESTAMP_FIELD_TYPE,
+            NUMBER_FIELD_TYPE
+        );
+        assertEquals(expectedDocCounts, docCounts(nonEmpty(defaultHistogram)));
+        assertFalse("the star-tree must decline " + histogram, searchUsesStarTree(segment, query, queryBuilder, histogram));
+    }
+
     private void assertStarTreeMatchesDefault(
         StarTreeSegment segment,
         Query query,
@@ -877,5 +909,76 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
             b.endObject();
             b.endObject();
         });
+    }
+
+    /**
+     * A date_histogram in a time zone other than UTC matches the default aggregation, on an interval of the star-tree and on a
+     * coarser one. The star-tree's timestamps are rounded on UTC calendar intervals, and a day rounded in UTC does not tell the
+     * day in New York, so the star-tree does not serve the request.
+     */
+    public void testDateHistogramWithTimeZone() throws IOException {
+        ZoneId newYork = ZoneId.of("America/New_York");
+        // In New York: on December 15th, then on January 9th, 10th, 10th and 11th
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                MONTH_AND_DAY,
+                "1969-12-15T12:00:00Z",
+                "1970-01-10T02:00:00Z",
+                "1970-01-10T12:00:00Z",
+                "1970-01-11T03:00:00Z",
+                "1970-01-11T23:00:00Z"
+            )
+        ) {
+            // Without empty buckets, so that star-tree buckets keyed off the histogram's rounding fail the comparison rather than
+            // an assertion of the reduce
+            assertStarTreeDeclines(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                histogram(DateHistogramInterval.DAY).timeZone(newYork).minDocCount(1),
+                Map.of(
+                    "1969-12-15T00:00:00.000-05:00",
+                    1L,
+                    "1970-01-09T00:00:00.000-05:00",
+                    1L,
+                    "1970-01-10T00:00:00.000-05:00",
+                    2L,
+                    "1970-01-11T00:00:00.000-05:00",
+                    1L
+                )
+            );
+            assertStarTreeDeclines(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                histogram(DateHistogramInterval.YEAR).timeZone(newYork).minDocCount(1),
+                Map.of("1969-01-01T00:00:00.000-05:00", 1L, "1970-01-01T00:00:00.000-05:00", 4L)
+            );
+        }
+    }
+
+    /**
+     * As {@link #testDateHistogramWithTimeZone}, in a time zone of a fixed offset that no calendar interval of the star-tree
+     * resolves, +05:45.
+     */
+    public void testDateHistogramWithOffsetTimeZone() throws IOException {
+        // At +05:45: on January 10th, 10th, 11th and 12th
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                MONTH_AND_DAY,
+                "1970-01-10T02:00:00Z",
+                "1970-01-10T12:00:00Z",
+                "1970-01-11T03:00:00Z",
+                "1970-01-11T23:00:00Z"
+            )
+        ) {
+            assertStarTreeDeclines(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                histogram(DateHistogramInterval.DAY).timeZone(ZoneId.of("+05:45")).minDocCount(1),
+                Map.of("1970-01-10T00:00:00.000+05:45", 2L, "1970-01-11T00:00:00.000+05:45", 1L, "1970-01-12T00:00:00.000+05:45", 1L)
+            );
+        }
     }
 }

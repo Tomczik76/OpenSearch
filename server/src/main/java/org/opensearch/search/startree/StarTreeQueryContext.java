@@ -220,6 +220,12 @@ public class StarTreeQueryContext {
             return false;
         }
 
+        // The star-tree's calendar intervals are rounded in UTC: a timestamp rounded in UTC does not tell its bucket in another
+        // time zone
+        if (dateHistogramAggregatorFactory.isUTC() == false) {
+            return false;
+        }
+
         // Find the closest valid interval in the DateTimeUnitRounding class associated with star tree
         DateTimeUnitRounding rounding = starTreeDateDimension.findClosestValidInterval(
             new DateTimeUnitAdapter(dateHistogramAggregatorFactory.getRounding())
