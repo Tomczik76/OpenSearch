@@ -728,4 +728,64 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
             assertEquals(formatAndRange.getKey(), regular, docValuesRangeQuery("@timestamp", window));
         }
     }
+
+    /**
+     * A null bound of a range is no bound, whether it is exclusive or not, as on the regular path: {@code gt null} still
+     * matches the dimension's smallest value and {@code lt null} its largest, on integer, long and unsigned_long dimensions.
+     * On unsigned_long the smallest value is 0.
+     */
+    public void testNullRangeBoundsMatchTheRegularPath() throws IOException {
+        QueryShardContext queryShardContext = mock(QueryShardContext.class);
+        List<Query> regularPath = new ArrayList<>();
+        List<Query> starTreePath = new ArrayList<>();
+        for (NumberFieldMapper.NumberType type : List.of(
+            NumberFieldMapper.NumberType.INTEGER,
+            NumberFieldMapper.NumberType.LONG,
+            NumberFieldMapper.NumberType.UNSIGNED_LONG
+        )) {
+            NumberFieldMapper.NumberFieldType fieldType = docValuesOnlyField(type);
+            SearchContext searchContext = searchContext(fieldType);
+            CompositeDataCubeFieldType starTree = starTree(starTreeField(new NumericDimension(fieldType.name())));
+            for (RangeQueryBuilder rangeQuery : List.of(
+                new RangeQueryBuilder(fieldType.name()).gt(null).lte(10),
+                new RangeQueryBuilder(fieldType.name()).gte(10).lt(null)
+            )) {
+                Query regular = fieldType.rangeQuery(
+                    rangeQuery.from(),
+                    rangeQuery.to(),
+                    rangeQuery.includeLower(),
+                    rangeQuery.includeUpper(),
+                    queryShardContext
+                );
+                regularPath.add(regular);
+                starTreePath.add(starTreeRangeQuery(fieldType, starTreeFilter(searchContext, rangeQuery, starTree), regular));
+            }
+        }
+        assertEquals(regularPath, starTreePath);
+    }
+
+    /** A numeric field with doc values only, so that the regular path's range query is a plain range over its inclusive bounds. */
+    private static NumberFieldMapper.NumberFieldType docValuesOnlyField(NumberFieldMapper.NumberType type) {
+        return new NumberFieldMapper.NumberFieldType(type.typeName(), type, false, false, true, false, true, null, Collections.emptyMap());
+    }
+
+    /**
+     * The doc values range query over the values the star-tree range filter of {@code fieldType} in {@code filter} matches, to
+     * compare with the regular path's query. A query the star-tree declines runs on the regular path, as {@code regular}.
+     */
+    private static Query starTreeRangeQuery(NumberFieldMapper.NumberFieldType fieldType, StarTreeFilter filter, Query regular) {
+        if (filter == null) {
+            return regular;
+        }
+        RangeMatchDimFilter range = (RangeMatchDimFilter) filter.getFiltersForDimension(fieldType.name()).getFirst();
+        if (fieldType.numberType() != NumberFieldMapper.NumberType.UNSIGNED_LONG) {
+            return docValuesRangeQuery(fieldType.name(), range);
+        }
+        assertTrue(range.isIncludeLow() && range.isIncludeHigh());
+        return SortedUnsignedLongDocValuesRangeQuery.newSlowRangeQuery(
+            fieldType.name(),
+            Numbers.toUnsignedBigInteger((Long) range.getLow()),
+            Numbers.toUnsignedBigInteger((Long) range.getHigh())
+        );
+    }
 }

@@ -225,29 +225,31 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
     public DimensionFilter getRangeMatchFilter(MappedFieldType mappedFieldType, StarTreeRangeQuery rangeQuery) {
         NumberFieldType numberFieldType = (NumberFieldType) mappedFieldType;
 
-        Long parsedLow = rangeQuery.from() == null
-            ? defaultMinimum()
-            : numberFieldType.numberType().parse(rangeQuery.from(), true).longValue();
-        Long parsedHigh = rangeQuery.to() == null
-            ? defaultMaximum()
-            : numberFieldType.numberType().parse(rangeQuery.to(), true).longValue();
-
-        // The decimal part is checked on the bound as given, since parsing it truncates it
-        boolean lowerTermHasDecimalPart = rangeQuery.from() != null && hasDecimalPart(rangeQuery.from());
-        if ((lowerTermHasDecimalPart == false && rangeQuery.includeLower() == false)
-            || (lowerTermHasDecimalPart && signum(rangeQuery.from()) > 0)) {
-            if (parsedLow.equals(defaultMaximum())) {
-                return new MatchNoneFilter();
+        long parsedLow = defaultMinimum();
+        long parsedHigh = defaultMaximum();
+        // As on the regular path, only a given bound is made inclusive: a null bound is no bound, even an exclusive one.
+        // The decimal part is checked on the bound as given, since parsing it truncates it.
+        if (rangeQuery.from() != null) {
+            parsedLow = numberFieldType.numberType().parse(rangeQuery.from(), true).longValue();
+            boolean lowerTermHasDecimalPart = hasDecimalPart(rangeQuery.from());
+            if ((lowerTermHasDecimalPart == false && rangeQuery.includeLower() == false)
+                || (lowerTermHasDecimalPart && signum(rangeQuery.from()) > 0)) {
+                if (parsedLow == defaultMaximum()) {
+                    return new MatchNoneFilter();
+                }
+                ++parsedLow;
             }
-            ++parsedLow;
         }
-        boolean upperTermHasDecimalPart = rangeQuery.to() != null && hasDecimalPart(rangeQuery.to());
-        if ((upperTermHasDecimalPart == false && rangeQuery.includeUpper() == false)
-            || (upperTermHasDecimalPart && signum(rangeQuery.to()) < 0)) {
-            if (parsedHigh.equals(defaultMinimum())) {
-                return new MatchNoneFilter();
+        if (rangeQuery.to() != null) {
+            parsedHigh = numberFieldType.numberType().parse(rangeQuery.to(), true).longValue();
+            boolean upperTermHasDecimalPart = hasDecimalPart(rangeQuery.to());
+            if ((upperTermHasDecimalPart == false && rangeQuery.includeUpper() == false)
+                || (upperTermHasDecimalPart && signum(rangeQuery.to()) < 0)) {
+                if (parsedHigh == defaultMinimum()) {
+                    return new MatchNoneFilter();
+                }
+                --parsedHigh;
             }
-            --parsedHigh;
         }
         return new RangeMatchDimFilter(mappedFieldType.name(), parsedLow, parsedHigh, true, true);
     }
