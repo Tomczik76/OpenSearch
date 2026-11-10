@@ -1202,6 +1202,88 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         ).subAggregation(max("max").field(STATUS));
     }
 
+    /**
+     * A terms or range aggregation on a field the index does not map has no field, and one with a missing value or a value
+     * script reads values the star-tree has no data for: the star-tree declines them, so the request takes the regular path
+     * instead of failing the shard or counting the wrong documents.
+     */
+    public void testAggregationsWithoutIndexedFieldValuesAreNotResolvedByTheStarTree() throws IOException {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(
+                StarTreeFilterTests.getExpandedMapping(
+                    1,
+                    false,
+                    StarTreeFilterTests.DIMENSION_TYPE_MAP,
+                    StarTreeFilterTests.METRIC_TYPE_MAP
+                )
+            );
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        MaxAggregationBuilder maxAgg = max("max").field("field");
+        assertTrue(
+            "terms on a dimension",
+            starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(terms("by_dv").field("dv").subAggregation(maxAgg)))
+        );
+        assertFalse(
+            "terms on an unmapped field",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(terms("by_unmapped").field("unmapped").subAggregation(maxAgg))
+            )
+        );
+        assertTrue(
+            "range on a dimension",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(range("by_dv").field("dv").addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        assertFalse(
+            "range with a missing value",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(range("by_dv").field("dv").missing(5).addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        assertFalse(
+            "range on an unmapped field",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(range("by_unmapped").field("unmapped").addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        Script valueScript = new Script(ScriptType.INLINE, AggregationTestScriptsPlugin.NAME, "_value + 1", Collections.emptyMap());
+        assertFalse(
+            "range with a value script",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0)
+                    .aggregation(range("by_dv").field("dv").script(valueScript).addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        assertFalse(
+            "terms with a value script",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(terms("by_dv").field("dv").script(valueScript).subAggregation(maxAgg))
+            )
+        );
+    }
+
     private boolean starTreeResolves(ShardSearchRequest request, SearchSourceBuilder source) throws IOException {
         request.source(source);
         SearchService searchService = getInstanceFromNode(SearchService.class);

@@ -178,6 +178,10 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         RangeAggregatorFactory rangeAggregatorFactory
     ) {
+        // The star-tree has no data for a missing value or a script, and an unmapped field has no field
+        if (rangeAggregatorFactory.readsIndexedFieldValues() == false) {
+            return false;
+        }
         // Validate request field is part of dimensions & is a numeric field
         // TODO: Add support for date type ranges
         return compositeIndexFieldInfo.getDimensions()
