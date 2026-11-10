@@ -42,8 +42,12 @@ import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.Plugin;
+import org.opensearch.script.Script;
+import org.opensearch.script.ScriptType;
 import org.opensearch.search.aggregations.AbstractAggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.AggregationTestScriptsPlugin;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.AggregatorFactory;
@@ -75,6 +79,7 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -1577,6 +1582,31 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).subAggregation(sum("sum").field(SIZE)))));
         assertFalse(
             starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).missing(0).subAggregation(sum("sum").field(SIZE))))
+        );
+    }
+
+    @Override
+    protected Collection<Class<? extends Plugin>> getPlugins() {
+        return pluginList(AggregationTestScriptsPlugin.class);
+    }
+
+    /**
+     * The star-tree pre-aggregates the field's indexed values, so it must not answer a metric aggregation with
+     * {@code missing} or a value script, at the top level or under a terms aggregation: the regular path must answer the
+     * whole request.
+     */
+    public void testMetricsWithMissingOrScriptAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        Script valueScript = new Script(ScriptType.INLINE, AggregationTestScriptsPlugin.NAME, "_value + 1", Collections.emptyMap());
+        assertTrue(starTreeResolves(request, aggregationSource(sum("sum").field(SIZE))));
+        assertFalse(starTreeResolves(request, aggregationSource(sum("sum").field(SIZE).missing(1000))));
+        assertFalse(starTreeResolves(request, aggregationSource(sum("sum").field(SIZE).script(valueScript))));
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE)))));
+        assertFalse(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE).missing(1000)))
+            )
         );
     }
 }

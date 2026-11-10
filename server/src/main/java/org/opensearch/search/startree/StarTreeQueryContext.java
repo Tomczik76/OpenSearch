@@ -147,7 +147,11 @@ public class StarTreeQueryContext {
             MetricStat metricStat = metricAggregatorFactory.getMetricStat();
             field = metricAggregatorFactory.getField();
 
-            return field != null && supportedMetrics.containsKey(field) && supportedMetrics.get(field).contains(metricStat);
+            // The star-tree has no data for a missing value or a script
+            return field != null
+                && metricAggregatorFactory.readsIndexedFieldValues()
+                && supportedMetrics.containsKey(field)
+                && supportedMetrics.get(field).contains(metricStat);
         }
         return false;
     }
