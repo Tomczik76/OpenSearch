@@ -29,6 +29,8 @@ import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.NumericUtils;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.util.FeatureFlags;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.indices.breaker.NoneCircuitBreakerService;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
@@ -41,17 +43,27 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.Aggregator;
+import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.AggregatorTestCase;
+import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
+import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.InternalTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
+import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
+import org.opensearch.search.aggregations.support.ValueType;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
+import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.startree.StarTreeQueryContext;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
 import static org.opensearch.index.codec.composite912.datacube.startree.AbstractStarTreeDVFormatTests.topMapping;
@@ -59,13 +71,16 @@ import static org.opensearch.search.aggregations.AggregationBuilders.avg;
 import static org.opensearch.search.aggregations.AggregationBuilders.count;
 import static org.opensearch.search.aggregations.AggregationBuilders.max;
 import static org.opensearch.search.aggregations.AggregationBuilders.min;
+import static org.opensearch.search.aggregations.AggregationBuilders.multiTerms;
 import static org.opensearch.search.aggregations.AggregationBuilders.sum;
 import static org.opensearch.search.aggregations.AggregationBuilders.terms;
 import static org.opensearch.search.aggregations.Aggregator.SubAggCollectionMode.BREADTH_FIRST;
 import static org.opensearch.search.aggregations.Aggregator.SubAggCollectionMode.DEPTH_FIRST;
 import static org.opensearch.test.InternalAggregationTestCase.DEFAULT_MAX_BUCKETS;
+import static org.mockito.Mockito.when;
 
 public class NumericTermsAggregatorTests extends AggregatorTestCase {
+    private static final String CLIENTIP = "clientip";
     private static FeatureFlags.TestUtils.FlagWriteLock fflock = null;
     final static String STATUS = "status";
     final static String SIZE = "size";
@@ -325,6 +340,91 @@ public class NumericTermsAggregatorTests extends AggregatorTestCase {
             assertEquals(defaultAggregation.getBuckets(), starTreeAggregation.getBuckets());
         }
         return defaultAggregation;
+    }
+
+    /**
+     * The star-tree declines an aggregation whose {@code value_type} reads a field as another type than its own, since it
+     * reads the values as their own type: terms or multi_terms on a numeric dimension read as strings, and a value_count of a
+     * numeric metric read as strings beneath terms, take the regular path. A {@code value_type} of the field's own type,
+     * numeric on a numeric field or string on a keyword, is still accepted, as is multi_terms on an IP dimension, which reads
+     * it as bytes without a {@code value_type}.
+     */
+    public void testValueTypeOfAnotherTypeIsDeclined() throws IOException {
+        assertTrue(starTreeAccepts(terms("terms").field(STATUS).subAggregation(sum("_sum").field(SIZE))));
+        assertTrue(starTreeAccepts(terms("terms").field(STATUS).userValueTypeHint(ValueType.LONG).subAggregation(sum("_sum").field(SIZE))));
+        assertFalse(
+            "terms on a numeric dimension read as strings",
+            starTreeAccepts(terms("terms").field(STATUS).userValueTypeHint(ValueType.STRING).subAggregation(sum("_sum").field(SIZE)))
+        );
+
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName(CLIENTIP).build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig statusAsLong = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setUserValueTypeHint(ValueType.LONG)
+            .build();
+        MultiTermsValuesSourceConfig statusAsString = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setUserValueTypeHint(ValueType.STRING)
+            .build();
+        assertTrue(starTreeAccepts(multiTerms("multi_terms").terms(List.of(clientIp, status))));
+        assertTrue(starTreeAccepts(multiTerms("multi_terms").terms(List.of(clientIp, statusAsLong))));
+        assertFalse(
+            "multi_terms on a numeric dimension read as strings",
+            starTreeAccepts(multiTerms("multi_terms").terms(List.of(clientIp, statusAsString)))
+        );
+        // Without a value_type, multi_terms reads an IP field as bytes, as the regular path does
+        LinkedHashMap<String, String> dimensions = new LinkedHashMap<>();
+        dimensions.put("sndv", "integer");
+        dimensions.put("address", "ip");
+        MapperService ipMapperService = StarTreeDocValuesFormatTests.createMapperService(
+            StarTreeFilterTests.getExpandedMapping(1, false, dimensions, Map.of("field", "integer"))
+        );
+        MultiTermsValuesSourceConfig address = new MultiTermsValuesSourceConfig.Builder().setFieldName("address").build();
+        MultiTermsValuesSourceConfig sndv = new MultiTermsValuesSourceConfig.Builder().setFieldName("sndv").build();
+        assertTrue(starTreeAccepts(ipMapperService, multiTerms("multi_terms").terms(List.of(address, sndv)), "address", "sndv"));
+
+        assertTrue(starTreeAccepts(terms("terms").field(CLIENTIP).subAggregation(count("_count").field(SIZE))));
+        assertTrue(
+            starTreeAccepts(terms("terms").field(CLIENTIP).userValueTypeHint(ValueType.STRING).subAggregation(count("_count").field(SIZE)))
+        );
+        assertFalse(
+            "value_count of a numeric metric read as strings",
+            starTreeAccepts(terms("terms").field(CLIENTIP).subAggregation(count("_count").field(SIZE).userValueTypeHint(ValueType.STRING)))
+        );
+    }
+
+    /** Whether the star-tree of {@link #getExpandedMapping} accepts a request made of {@code aggregation}. */
+    private boolean starTreeAccepts(AggregationBuilder aggregation) throws IOException {
+        MapperService mapperService = StarTreeDocValuesFormatTests.createMapperService(getExpandedMapping(1, false));
+        return starTreeAccepts(mapperService, aggregation, STATUS, SIZE, CLIENTIP);
+    }
+
+    /**
+     * Whether the star-tree of {@code mapperService} accepts a request made of {@code aggregation}, whose factories are built
+     * as on a shard, with the mapped types of {@code fields}.
+     */
+    private boolean starTreeAccepts(MapperService mapperService, AggregationBuilder aggregation, String... fields) throws IOException {
+        MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
+            DEFAULT_MAX_BUCKETS,
+            new NoneCircuitBreakerService().getBreaker(CircuitBreaker.REQUEST)
+        );
+        try (Directory directory = newDirectory()) {
+            new IndexWriter(directory, new IndexWriterConfig()).close();
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                SearchContext searchContext = createSearchContext(
+                    newSearcher(reader, false, false),
+                    createIndexSettings(),
+                    new MatchAllDocsQuery(),
+                    bucketConsumer,
+                    Arrays.stream(fields).map(mapperService::fieldType).toArray(MappedFieldType[]::new)
+                );
+                AggregatorFactories factories = AggregatorFactories.builder()
+                    .addAggregator(aggregation)
+                    .build(searchContext.getQueryShardContext(), null);
+                when(searchContext.aggregations()).thenReturn(new SearchContextAggregations(factories, bucketConsumer));
+                when(searchContext.mapperService()).thenReturn(mapperService);
+                return new StarTreeQueryContext(searchContext, null).consolidateAllFilters(searchContext);
+            }
+        }
     }
 
     public static XContentBuilder getExpandedMapping(int maxLeafDocs, boolean skipStarNodeCreationForStatusDimension) throws IOException {

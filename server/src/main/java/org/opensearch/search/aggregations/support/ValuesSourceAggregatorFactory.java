@@ -109,9 +109,12 @@ public abstract class ValuesSourceAggregatorFactory extends AggregatorFactory {
 
     /**
      * Returns whether the aggregation reads the field's values as they are indexed: no {@code missing} value or script
-     * changes them at read time.
+     * changes them at read time, and no {@code value_type} reads them as another type.
      */
     public boolean readsIndexedFieldValues() {
-        return config.fieldContext() != null && config.missing() == null && config.script() == null;
+        return config.fieldContext() != null
+            && config.missing() == null
+            && config.script() == null
+            && config.readsFieldAsAnotherType() == false;
     }
 }

@@ -65,6 +65,7 @@ import org.opensearch.search.aggregations.startree.DateHistogramAggregatorTests;
 import org.opensearch.search.aggregations.startree.NumericTermsAggregatorTests;
 import org.opensearch.search.aggregations.startree.StarTreeFilterTests;
 import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
+import org.opensearch.search.aggregations.support.ValueType;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.AliasFilter;
@@ -1761,6 +1762,67 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
             starTreeResolves(
                 request,
                 aggregationSource(multiTerms("mt").terms(List.of(clientIpExcluded, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
+
+    /**
+     * A {@code value_type} that reads a field as another type than its own is not answered by the star-tree, which reads
+     * the values as their own type: terms or multi_terms on a numeric dimension read as strings, or a value_count of a
+     * numeric metric read as strings, take the regular path. A {@code value_type} of the field's own type is still answered
+     * by the star-tree.
+     */
+    public void testValueTypeOfAnotherTypeIsNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).subAggregation(sum("sum").field(SIZE)))));
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field(STATUS).userValueTypeHint(ValueType.LONG).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "terms on a numeric dimension read as strings",
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field(STATUS).userValueTypeHint(ValueType.STRING).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip").build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig statusAsString = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setUserValueTypeHint(ValueType.STRING)
+            .build();
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "multi_terms on a numeric dimension read as strings",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusAsString)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(
+                    terms("terms").field("clientip").userValueTypeHint(ValueType.STRING).subAggregation(count("count").field(SIZE))
+                )
+            )
+        );
+        assertFalse(
+            "value_count of a numeric metric read as strings",
+            starTreeResolves(
+                request,
+                aggregationSource(
+                    terms("terms").field("clientip").subAggregation(count("count").field(SIZE).userValueTypeHint(ValueType.STRING))
+                )
             )
         );
     }

@@ -180,12 +180,17 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
 
     /**
      * Returns whether every term reads its field's values as they are indexed: no {@code missing} value or script changes
-     * them at read time.
+     * them at read time, and no {@code value_type} reads them as another type.
      */
     public boolean readsIndexedFieldValues() {
         return configs.stream()
             .map(Tuple::v1)
-            .allMatch(config -> config.fieldContext() != null && config.missing() == null && config.script() == null);
+            .allMatch(
+                config -> config.fieldContext() != null
+                    && config.missing() == null
+                    && config.script() == null
+                    && config.readsFieldAsAnotherType() == false
+            );
     }
 
     /**
