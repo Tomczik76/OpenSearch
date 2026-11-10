@@ -788,4 +788,51 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
             Numbers.toUnsignedBigInteger((Long) range.getHigh())
         );
     }
+
+    /**
+     * A bound or a term outside the range of a byte or short dimension is parsed as an integer, as on the regular path,
+     * rather than failing the request: {@code lt 100000} matches every value and {@code gt -100000} too, {@code term 100000}
+     * matches none and {@code terms [5, 100000]} only 5.
+     */
+    public void testOutOfRangeValuesOnByteAndShortDimensionsMatchLikeTheRegularPath() throws IOException {
+        QueryShardContext queryShardContext = mock(QueryShardContext.class);
+        List<Query> regularRanges = new ArrayList<>();
+        List<Query> starTreeRanges = new ArrayList<>();
+        Map<String, Set<Long>> regularTerms = new LinkedHashMap<>();
+        Map<String, Set<Long>> starTreeTerms = new LinkedHashMap<>();
+        for (NumberFieldMapper.NumberType type : List.of(NumberFieldMapper.NumberType.BYTE, NumberFieldMapper.NumberType.SHORT)) {
+            NumberFieldMapper.NumberFieldType fieldType = docValuesOnlyField(type);
+            SearchContext searchContext = searchContext(fieldType);
+            StarTreeField starTreeField = starTreeField(new NumericDimension(fieldType.name()));
+            for (RangeQueryBuilder rangeQuery : List.of(
+                new RangeQueryBuilder(fieldType.name()).lt(100000),
+                new RangeQueryBuilder(fieldType.name()).gt(-100000)
+            )) {
+                Query regular = fieldType.rangeQuery(
+                    rangeQuery.from(),
+                    rangeQuery.to(),
+                    rangeQuery.includeLower(),
+                    rangeQuery.includeUpper(),
+                    queryShardContext
+                );
+                regularRanges.add(regular);
+                starTreeRanges.add(
+                    starTreeRangeQuery(fieldType, starTreeFilter(searchContext, rangeQuery, starTree(starTreeField)), regular)
+                );
+            }
+
+            assertNotNull(fieldType.termQuery(100000, null));
+            String term = type.typeName() + " term 100000";
+            regularTerms.put(term, Set.of());
+            QueryBuilder termQuery = new TermQueryBuilder(fieldType.name(), 100000);
+            starTreeTerms.put(term, matchedValues(termQuery, regularTerms.get(term), searchContext, starTreeField));
+            assertNotNull(fieldType.termsQuery(List.of(5, 100000), null));
+            String terms = type.typeName() + " terms [5, 100000]";
+            regularTerms.put(terms, Set.of(5L));
+            QueryBuilder termsQuery = new TermsQueryBuilder(fieldType.name(), List.of(5, 100000));
+            starTreeTerms.put(terms, matchedValues(termsQuery, regularTerms.get(terms), searchContext, starTreeField));
+        }
+        assertEquals(regularRanges, starTreeRanges);
+        assertEquals(regularTerms, starTreeTerms);
+    }
 }

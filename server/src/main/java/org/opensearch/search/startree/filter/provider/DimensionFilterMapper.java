@@ -26,6 +26,7 @@ import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.NumberFieldMapper.NumberFieldType;
+import org.opensearch.index.mapper.NumberFieldMapper.NumberType;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.startree.filter.DimensionFilter;
 import org.opensearch.search.startree.filter.ExactMatchDimFilter;
@@ -212,7 +213,7 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
         for (Object rawValue : rawValues) {
             // As on the regular path, a value with a decimal part matches no value of an integer-type field
             if (hasDecimalPart(rawValue) == false) {
-                convertedValues.add(numberFieldType.numberType().parse(rawValue, true).longValue());
+                convertedValues.add(queryType(numberFieldType).parse(rawValue, true).longValue());
             }
         }
         if (convertedValues.isEmpty()) {
@@ -230,7 +231,7 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
         // As on the regular path, only a given bound is made inclusive: a null bound is no bound, even an exclusive one.
         // The decimal part is checked on the bound as given, since parsing it truncates it.
         if (rangeQuery.from() != null) {
-            parsedLow = numberFieldType.numberType().parse(rangeQuery.from(), true).longValue();
+            parsedLow = queryType(numberFieldType).parse(rangeQuery.from(), true).longValue();
             boolean lowerTermHasDecimalPart = hasDecimalPart(rangeQuery.from());
             if ((lowerTermHasDecimalPart == false && rangeQuery.includeLower() == false)
                 || (lowerTermHasDecimalPart && signum(rangeQuery.from()) > 0)) {
@@ -241,7 +242,7 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
             }
         }
         if (rangeQuery.to() != null) {
-            parsedHigh = numberFieldType.numberType().parse(rangeQuery.to(), true).longValue();
+            parsedHigh = queryType(numberFieldType).parse(rangeQuery.to(), true).longValue();
             boolean upperTermHasDecimalPart = hasDecimalPart(rangeQuery.to());
             if ((upperTermHasDecimalPart == false && rangeQuery.includeUpper() == false)
                 || (upperTermHasDecimalPart && signum(rangeQuery.to()) < 0)) {
@@ -254,6 +255,11 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
         return new RangeMatchDimFilter(mappedFieldType.name(), parsedLow, parsedHigh, true, true);
     }
 
+    /** The type the regular path parses the terms and bounds of a query on the dimension as. */
+    NumberType queryType(NumberFieldType numberFieldType) {
+        return numberFieldType.numberType();
+    }
+
     abstract Long defaultMinimum();
 
     abstract Long defaultMaximum();
@@ -261,6 +267,12 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
 }
 
 class IntegerFieldMapperNumeric extends NumericNonDecimalMapper {
+    /** Byte and short fields are queried as integers, so a value outside their range matches nothing rather than failing. */
+    @Override
+    NumberType queryType(NumberFieldType numberFieldType) {
+        return INTEGER;
+    }
+
     @Override
     Long defaultMinimum() {
         return (long) Integer.MIN_VALUE;
