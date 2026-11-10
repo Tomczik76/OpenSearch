@@ -1560,4 +1560,23 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
     private static SearchSourceBuilder aggregationSource(AbstractAggregationBuilder<?> aggregation) {
         return new SearchSourceBuilder().size(0).query(new MatchAllQueryBuilder()).aggregation(aggregation);
     }
+
+    /**
+     * The star-tree has no entry for the documents without a value, so it must not answer a terms aggregation with
+     * {@code missing}, on a keyword or a numeric dimension.
+     */
+    public void testTermsWithMissingAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE)))));
+        assertFalse(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").missing("N/A").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).subAggregation(sum("sum").field(SIZE)))));
+        assertFalse(
+            starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).missing(0).subAggregation(sum("sum").field(SIZE))))
+        );
+    }
 }

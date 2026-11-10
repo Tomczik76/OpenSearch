@@ -106,4 +106,12 @@ public abstract class ValuesSourceAggregatorFactory extends AggregatorFactory {
     public String getField() {
         return config.fieldContext() != null ? config.fieldContext().field() : null;
     }
+
+    /**
+     * Returns whether the aggregation reads the field's values as they are indexed: no {@code missing} value or script
+     * changes them at read time.
+     */
+    public boolean readsIndexedFieldValues() {
+        return config.fieldContext() != null && config.missing() == null && config.script() == null;
+    }
 }

@@ -156,8 +156,9 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         TermsAggregatorFactory termsAggregatorFactory
     ) {
-        // The map execution mode does not pre-compute with the star-tree
-        if (termsAggregatorFactory.collectsInMapMode()) {
+        // The map execution mode does not pre-compute with the star-tree, and the star-tree has no data for a missing
+        // value or a script
+        if (termsAggregatorFactory.collectsInMapMode() || termsAggregatorFactory.readsIndexedFieldValues() == false) {
             return false;
         }
         // Validate request field is part of dimensions. The date dimension is stored only as its calendar-interval
