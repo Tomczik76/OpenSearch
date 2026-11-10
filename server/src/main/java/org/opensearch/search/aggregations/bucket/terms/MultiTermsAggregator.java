@@ -463,6 +463,9 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
                     NumberFieldMapper.NumberFieldType numberFieldType = ((NumberFieldMapper.NumberFieldType) context.mapperService()
                         .fieldType(fieldName));
                     termValueBuilders.add(val -> TermValue.of(numberFieldType.toDoubleValue(val)));
+                } else if (numericSource.isBigInteger()) {
+                    // As on the regular path, an unsigned_long is keyed by its unsigned value, not the signed long holding it
+                    termValueBuilders.add(val -> TermValue.of(Numbers.toUnsignedBigInteger(val)));
                 } else {
                     termValueBuilders.add(TermValue::of);
                 }
