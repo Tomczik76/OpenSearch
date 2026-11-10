@@ -835,4 +835,35 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
         assertEquals(regularRanges, starTreeRanges);
         assertEquals(regularTerms, starTreeTerms);
     }
+
+    /**
+     * An inclusive bound of a half_float range that is not a half float is rounded inward to one, as on the regular path:
+     * {@code gte 1.0001} starts above 1 and {@code lte 1.0009} ends at 1, rather than at the nearest half float, and
+     * {@code gte -1.0009 lte -1.0001}, between two half floats, matches nothing. An exclusive bound already was.
+     */
+    public void testInclusiveHalfFloatRangeBoundsAreRoundedInwardLikeTheRegularPath() throws IOException {
+        QueryShardContext queryShardContext = mock(QueryShardContext.class);
+        NumberFieldMapper.NumberFieldType fieldType = docValuesOnlyField(NumberFieldMapper.NumberType.HALF_FLOAT);
+        SearchContext searchContext = searchContext(fieldType);
+        CompositeDataCubeFieldType starTree = starTree(starTreeField(new NumericDimension(fieldType.name())));
+        List<Query> regularPath = new ArrayList<>();
+        List<Query> starTreePath = new ArrayList<>();
+        for (RangeQueryBuilder rangeQuery : List.of(
+            new RangeQueryBuilder(fieldType.name()).gte(1.0001).lte(2),
+            new RangeQueryBuilder(fieldType.name()).gte(0.5).lte(1.0009),
+            new RangeQueryBuilder(fieldType.name()).gte(-1.0009).lte(-1.0001),
+            new RangeQueryBuilder(fieldType.name()).gt(1.0001).lt(1.0009)
+        )) {
+            Query regular = fieldType.rangeQuery(
+                rangeQuery.from(),
+                rangeQuery.to(),
+                rangeQuery.includeLower(),
+                rangeQuery.includeUpper(),
+                queryShardContext
+            );
+            regularPath.add(regular);
+            starTreePath.add(starTreeRangeQuery(fieldType, starTreeFilter(searchContext, rangeQuery, starTree), regular));
+        }
+        assertEquals(regularPath, starTreePath);
+    }
 }

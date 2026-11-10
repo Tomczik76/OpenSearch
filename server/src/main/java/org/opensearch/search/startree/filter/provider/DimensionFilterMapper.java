@@ -342,19 +342,25 @@ abstract class NumericDecimalFieldMapper extends NumericMapper {
         Number u = Long.MAX_VALUE;
         if (rangeQuery.from() != null) {
             l = numberFieldType.numberType().parse(rangeQuery.from(), false);
-            if (rangeQuery.includeLower() == false) {
-                l = getNextHigh(l);
-            }
+            l = rangeQuery.includeLower() ? getInclusiveLow(l) : getNextHigh(l);
             l = convertToDocValues(l);
         }
         if (rangeQuery.to() != null) {
             u = numberFieldType.numberType().parse(rangeQuery.to(), false);
-            if (rangeQuery.includeUpper() == false) {
-                u = getNextLow(u);
-            }
+            u = rangeQuery.includeUpper() ? getInclusiveHigh(u) : getNextLow(u);
             u = convertToDocValues(u);
         }
         return new RangeMatchDimFilter(numberFieldType.name(), l, u, true, true);
+    }
+
+    /** The inclusive lower bound of a range from {@code parsedValue} included, by default the value itself. */
+    Number getInclusiveLow(Number parsedValue) {
+        return parsedValue;
+    }
+
+    /** The inclusive upper bound of a range to {@code parsedValue} included, by default the value itself. */
+    Number getInclusiveHigh(Number parsedValue) {
+        return parsedValue;
     }
 
     abstract long convertToDocValues(Number parsedValue);
@@ -369,6 +375,18 @@ class HalfFloatFieldMapperNumeric extends NumericDecimalFieldMapper {
     @Override
     long convertToDocValues(Number parsedValue) {
         return HalfFloatPoint.halfFloatToSortableShort((Float) parsedValue);
+    }
+
+    /** As on the regular path, a bound between two half floats is rounded up to the next one, not to the nearest. */
+    @Override
+    Number getInclusiveLow(Number parsedValue) {
+        return HalfFloatPoint.nextUp(HalfFloatPoint.nextDown((Float) parsedValue));
+    }
+
+    /** As on the regular path, a bound between two half floats is rounded down to the previous one, not to the nearest. */
+    @Override
+    Number getInclusiveHigh(Number parsedValue) {
+        return HalfFloatPoint.nextDown(HalfFloatPoint.nextUp((Float) parsedValue));
     }
 
     @Override
