@@ -83,6 +83,9 @@ public interface StarTreeFilterProvider {
         public StarTreeFilter getFilter(SearchContext context, QueryBuilder rawFilter, CompositeDataCubeFieldType compositeFieldType)
             throws IOException {
             TermQueryBuilder termQueryBuilder = (TermQueryBuilder) rawFilter;
+            if (termQueryBuilder.caseInsensitive()) {
+                return null; // A star-tree term filter matches the value as given, not every casing of it
+            }
             String field = termQueryBuilder.fieldName();
             MappedFieldType mappedFieldType = context.mapperService().fieldType(field);
             DimensionFilterMapper dimensionFilterMapper = mappedFieldType != null

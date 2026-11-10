@@ -1392,6 +1392,23 @@ public class BoolStarTreeFilterProviderTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A case-insensitive term matches every casing of its value on the regular path, but a star-tree term filter matches the
+     * value as given, so the provider declines the query, alone or in a bool query, and the regular path counts {@code GET} for
+     * {@code get}.
+     */
+    public void testCaseInsensitiveTermReturnsNull() throws IOException {
+        TermQueryBuilder caseInsensitive = new TermQueryBuilder(METHOD, "get").caseInsensitive(true);
+        for (QueryBuilder query : List.of(
+            caseInsensitive,
+            new BoolQueryBuilder().filter(caseInsensitive),
+            new BoolQueryBuilder().filter(new TermQueryBuilder(STATUS, 200)).filter(caseInsensitive)
+        )) {
+            StarTreeFilterProvider provider = StarTreeFilterProvider.SingletonFactory.getProvider(query);
+            assertNull(query.toString(), provider.getFilter(searchContext, query, compositeFieldType));
+        }
+    }
+
     // Helper methods for assertions
     private void assertExactMatchValue(ExactMatchDimFilter filter, String expectedValue) {
         assertEquals(new BytesRef(expectedValue), filter.getRawValues().getFirst());
