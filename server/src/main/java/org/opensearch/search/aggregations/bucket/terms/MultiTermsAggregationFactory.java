@@ -171,6 +171,16 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
     }
 
     /**
+     * Returns whether every term reads its field's values as they are indexed: no {@code missing} value or script changes
+     * them at read time.
+     */
+    public boolean readsIndexedFieldValues() {
+        return configs.stream()
+            .map(Tuple::v1)
+            .allMatch(config -> config.fieldContext() != null && config.missing() == null && config.script() == null);
+    }
+
+    /**
      * Returns the per-field global-ordinal counts ({@code maxOrds}) to pack for the given configs when the
      * ordinal path is eligible, or {@code null} to fall back to the default byte-key path. Falls back when a
      * star-tree index is active, when any field is not backed by global ordinals, or when any field carries an

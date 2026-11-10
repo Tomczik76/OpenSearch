@@ -254,6 +254,10 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         MultiTermsAggregationFactory multiTermsAggregationFactory
     ) {
+        // The star-tree has no data for a missing value or a script, as for terms
+        if (multiTermsAggregationFactory.readsIndexedFieldValues() == false) {
+            return false;
+        }
         // The date dimension is stored only as its calendar-interval sub-dimensions, as for terms
         return compositeIndexFieldInfo.getDimensions()
             .stream()

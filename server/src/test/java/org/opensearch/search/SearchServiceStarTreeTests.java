@@ -1691,4 +1691,40 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
             )
         );
     }
+
+    /**
+     * A multi_terms aggregation whose terms a missing value or a script changes at read time is not answered by the star-tree,
+     * which has no data for either: the request takes the regular path, as for terms.
+     */
+    public void testMultiTermsWithMissingOrScriptAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip").build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig statusWithMissing = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setMissing(0)
+            .build();
+        MultiTermsValuesSourceConfig statusWithScript = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setScript(new Script(ScriptType.INLINE, AggregationTestScriptsPlugin.NAME, "_value + 1", Collections.emptyMap()))
+            .build();
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "missing",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusWithMissing)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "value script",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusWithScript)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
 }
