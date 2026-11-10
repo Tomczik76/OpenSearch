@@ -17,6 +17,7 @@ import org.apache.lucene.codecs.lucene104.Lucene104Codec;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
@@ -42,6 +43,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorTestCase;
+import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.InternalTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
@@ -187,7 +189,94 @@ public class NumericTermsAggregatorTests extends AggregatorTestCase {
         directory.close();
     }
 
-    private void testCase(
+    /**
+     * The star-tree path of a numeric terms aggregation applies {@code include}: it returns buckets only for the included
+     * values of the dimension.
+     */
+    public void testInclude() throws IOException {
+        IncludeExclude include = new IncludeExclude(new long[] { 1, 2 }, null);
+        testCaseInOneSegment(terms("terms_agg").field(STATUS).includeExclude(include).subAggregation(sum("_sum").field(SIZE)));
+    }
+
+    /**
+     * The star-tree path of a numeric terms aggregation applies {@code exclude}: it returns no bucket for the excluded
+     * values of the dimension.
+     */
+    public void testExclude() throws IOException {
+        IncludeExclude exclude = new IncludeExclude(null, new long[] { 1 });
+        testCaseInOneSegment(terms("terms_agg").field(STATUS).includeExclude(exclude).subAggregation(sum("_sum").field(SIZE)));
+    }
+
+    /**
+     * The star-tree path of a numeric terms aggregation on a floating-point dimension applies {@code include} and
+     * {@code exclude} to the dimension's values as doubles, as the regular path does, not to the float's sortable bits that
+     * the star-tree holds.
+     */
+    public void testIncludeAndExcludeOnAFloatingPointDimension() throws IOException {
+        IncludeExclude include = new IncludeExclude(new double[] { 20.5, 30.5 }, null);
+        assertEquals(
+            List.of(20.5, 30.5),
+            testCaseInOneSegment(terms("terms_agg").field(SIZE).includeExclude(include).subAggregation(sum("_sum").field(STATUS)))
+        );
+        IncludeExclude exclude = new IncludeExclude(null, new double[] { 10.5, 20.5, 30.5 });
+        assertEquals(
+            List.of(40.5, 50.5, 60.5, 70.5),
+            testCaseInOneSegment(terms("terms_agg").field(SIZE).includeExclude(exclude).subAggregation(sum("_sum").field(STATUS)))
+        );
+    }
+
+    /**
+     * Runs {@code termsAggregationBuilder} with and without the star-tree over documents in one segment, some of them
+     * without a status, asserts that the results are the same, and returns the keys of the buckets.
+     */
+    private List<Object> testCaseInOneSegment(TermsAggregationBuilder termsAggregationBuilder) throws IOException {
+        try (Directory directory = newDirectory()) {
+            IndexWriterConfig conf = new IndexWriterConfig();
+            conf.setCodec(getCodec());
+            try (IndexWriter iw = new IndexWriter(directory, conf)) {
+                iw.addDocument(doc(1, 10.5f));
+                iw.addDocument(doc(1, 20.5f));
+                iw.addDocument(doc(2, 30.5f));
+                iw.addDocument(doc(3, 40.5f));
+                iw.addDocument(doc(4, 50.5f));
+                iw.addDocument(doc(null, 60.5f));
+                iw.addDocument(doc(null, 70.5f));
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                assertEquals(1, reader.leaves().size());
+                SegmentReader segmentReader = Lucene.segmentReader(reader.leaves().get(0).reader());
+                CompositeIndexFieldInfo starTree = ((CompositeIndexReader) segmentReader.getDocValuesReader()).getCompositeIndexFields()
+                    .get(0);
+                LinkedHashMap<Dimension, MappedFieldType> supportedDimensions = new LinkedHashMap<>();
+                supportedDimensions.put(new NumericDimension(STATUS), STATUS_FIELD_TYPE);
+                supportedDimensions.put(new NumericDimension(SIZE), SIZE_FIELD_NAME);
+                InternalTerms<?, ?> terms = testCase(
+                    newSearcher(reader, false, false),
+                    new MatchAllDocsQuery(),
+                    null,
+                    termsAggregationBuilder,
+                    starTree,
+                    supportedDimensions
+                );
+                return terms.getBuckets().stream().map(bucket -> bucket.getKey()).toList();
+            }
+        }
+    }
+
+    private static Document doc(Integer status, float size) {
+        Document doc = new Document();
+        if (status != null) {
+            doc.add(new SortedNumericDocValuesField(STATUS, status));
+        }
+        doc.add(new SortedNumericDocValuesField(SIZE, NumericUtils.floatToSortableInt(size)));
+        return doc;
+    }
+
+    /**
+     * Runs {@code termsAggregationBuilder} with and without the star-tree, in each collection mode, asserts that the results
+     * are the same, and returns the result without the star-tree.
+     */
+    private InternalTerms<?, ?> testCase(
         IndexSearcher indexSearcher,
         Query query,
         QueryBuilder queryBuilder,
@@ -195,6 +284,7 @@ public class NumericTermsAggregatorTests extends AggregatorTestCase {
         CompositeIndexFieldInfo starTree,
         LinkedHashMap<Dimension, MappedFieldType> supportedDimensions
     ) throws IOException {
+        InternalTerms<?, ?> defaultAggregation = null;
         for (Aggregator.SubAggCollectionMode collectionMode : List.of(DEPTH_FIRST, BREADTH_FIRST)) {
             termsAggregationBuilder.collectMode(collectionMode);
             InternalTerms starTreeAggregation = searchAndReduceStarTree(
@@ -214,7 +304,7 @@ public class NumericTermsAggregatorTests extends AggregatorTestCase {
                 SIZE_FIELD_NAME
             );
 
-            InternalTerms defaultAggregation = searchAndReduceStarTree(
+            defaultAggregation = searchAndReduceStarTree(
                 createIndexSettings(),
                 indexSearcher,
                 query,
@@ -234,6 +324,7 @@ public class NumericTermsAggregatorTests extends AggregatorTestCase {
             assertEquals(defaultAggregation.getBuckets().size(), starTreeAggregation.getBuckets().size());
             assertEquals(defaultAggregation.getBuckets(), starTreeAggregation.getBuckets());
         }
+        return defaultAggregation;
     }
 
     public static XContentBuilder getExpandedMapping(int maxLeafDocs, boolean skipStarNodeCreationForStatusDimension) throws IOException {

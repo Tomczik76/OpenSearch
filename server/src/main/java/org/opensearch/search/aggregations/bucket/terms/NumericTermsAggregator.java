@@ -222,6 +222,9 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
                     );
                     dimensionValue = NumericUtils.doubleToSortableLong(doubleValue);
                 }
+                if (longFilter != null && longFilter.accept(dimensionValue) == false) {
+                    return;
+                }
 
                 for (int i = 0, count = valuesIterator.entryValueCount(); i < count; i++) {
                     if (docCountsIterator.advanceExact(starTreeEntry)) {
