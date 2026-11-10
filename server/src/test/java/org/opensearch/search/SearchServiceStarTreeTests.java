@@ -1506,4 +1506,58 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
 
         setStarTreeIndexSetting(null);
     }
+
+    /**
+     * A keyword terms aggregation in {@code map} execution mode does not pre-compute with the star-tree, so the star-tree
+     * must not answer it: its metric sub-aggregations would leave their work to it and collect nothing.
+     */
+    public void testMapExecutionHintIsNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE)))));
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").executionHint("global_ordinals").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").executionHint("map").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        // Numeric terms ignore the execution hint
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field(STATUS).executionHint("map").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
+
+    /** Creates an index with the star-tree of {@link NumericTermsAggregatorTests} and a request on its shard. */
+    private ShardSearchRequest createRequestOnTermsIndex() throws IOException {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(NumericTermsAggregatorTests.getExpandedMapping(1, false));
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        return new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+    }
+
+    private static SearchSourceBuilder aggregationSource(AbstractAggregationBuilder<?> aggregation) {
+        return new SearchSourceBuilder().size(0).query(new MatchAllQueryBuilder()).aggregation(aggregation);
+    }
 }
