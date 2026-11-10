@@ -34,6 +34,7 @@ public class DimensionFilterMergerUtilsTests extends OpenSearchTestCase {
 
     private DimensionFilterMapper numericMapper;
     private DimensionFilterMapper keywordMapper;
+    private DimensionFilterMapper unsignedLongMapper;
     private final SearchContext searchContext = mock(SearchContext.class);
 
     @Before
@@ -43,12 +44,27 @@ public class DimensionFilterMergerUtilsTests extends OpenSearchTestCase {
             searchContext
         );
         keywordMapper = DimensionFilterMapper.Factory.fromMappedFieldType(new KeywordFieldMapper.KeywordFieldType("method"), searchContext);
+        unsignedLongMapper = DimensionFilterMapper.Factory.fromMappedFieldType(
+            new NumberFieldMapper.NumberFieldType("unsigned_field", NumberFieldMapper.NumberType.UNSIGNED_LONG),
+            searchContext
+        );
     }
 
     public void testIntersectionWithAFilterThatMatchesNothingIsNull() {
         DimensionFilter exact = new ExactMatchDimFilter("status", List.of(200L));
         assertNull(DimensionFilterMergerUtils.intersect(new MatchNoneFilter(), exact, numericMapper));
         assertNull(DimensionFilterMergerUtils.intersect(exact, new MatchNoneFilter(), numericMapper));
+    }
+
+    /**
+     * An unsigned_long range whose lower bound is above its upper bound, such as {@code gt 5 lt 6}, which becomes [6, 5], is
+     * empty, so its intersection with a term is too: such a range does not wrap around the largest unsigned_long.
+     */
+    public void testUnsignedLongEmptyRangeIntersectedWithATermIsEmpty() {
+        RangeMatchDimFilter empty = range("unsigned_field", 6L, 5L, true, true);
+        ExactMatchDimFilter term = exactMatch("unsigned_field", List.of(7L));
+        assertNoIntersection(empty, term, unsignedLongMapper);
+        assertNoIntersection(term, empty, unsignedLongMapper);
     }
 
     public void testRangeIntersection() {
@@ -223,12 +239,6 @@ public class DimensionFilterMergerUtilsTests extends OpenSearchTestCase {
     }
 
     public void testUnsignedLongRangeIntersection() {
-        // Setup unsigned long mapper
-        DimensionFilterMapper unsignedLongMapper = DimensionFilterMapper.Factory.fromMappedFieldType(
-            new NumberFieldMapper.NumberFieldType("unsigned_field", NumberFieldMapper.NumberType.UNSIGNED_LONG),
-            searchContext
-        );
-
         // Test case 1: Regular positive values
         assertRangeIntersection(
             range("unsigned_field", 100L, 500L, true, true),

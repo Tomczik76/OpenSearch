@@ -307,21 +307,6 @@ class UnsignedLongFieldMapperNumeric extends NumericNonDecimalMapper {
         return Long.compareUnsigned((Long) v1, (Long) v2);
     }
 
-    @Override
-    public boolean isValueInRange(Object value, Object low, Object high, boolean includeLow, boolean includeHigh) {
-        long v = (Long) value;
-        long l = low != null ? (Long) low : 0L;
-        long h = high != null ? (Long) high : -1L; // -1L is max unsigned
-
-        if (Long.compareUnsigned(l, h) > 0) {
-            return (Long.compareUnsigned(v, l) > 0 || (Long.compareUnsigned(v, l) == 0 && includeLow))
-                || (Long.compareUnsigned(v, h) < 0 || (Long.compareUnsigned(v, h) == 0 && includeHigh));
-        }
-
-        // Normal case
-        return super.isValueInRange(value, low, high, includeLow, includeHigh);
-    }
-
 }
 
 abstract class NumericDecimalFieldMapper extends NumericMapper {
