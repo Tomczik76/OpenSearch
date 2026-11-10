@@ -62,6 +62,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.LongUnaryOperator;
 
 import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
 import static org.opensearch.search.aggregations.bucket.terms.TermsAggregator.descendsFromNestedAggregator;
@@ -446,9 +447,12 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
             ValuesSource vs = multiTermsValue.rawValueSources.get(i);
 
             if (vs instanceof ValuesSource.Bytes.WithOrdinals vsBytes) {
+                // The star-tree holds the segment's ordinals: map them to global ordinals before looking them up
+                SortedSetDocValues globalOrds = vsBytes.globalOrdinalsValues(ctx);
+                LongUnaryOperator globalOrdinalsMapping = vsBytes.globalOrdinalsMapping(ctx);
                 termValueBuilders.add(ord -> {
                     try {
-                        return TermValue.of(vsBytes.globalOrdinalsValues(ctx).lookupOrd(ord));
+                        return TermValue.of(globalOrds.lookupOrd(globalOrdinalsMapping.applyAsLong(ord)));
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }

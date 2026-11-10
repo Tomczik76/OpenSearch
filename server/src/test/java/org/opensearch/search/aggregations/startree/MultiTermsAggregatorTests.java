@@ -18,8 +18,10 @@ import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -168,6 +170,51 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
 
         ir.close();
         directory.close();
+    }
+
+    /**
+     * multi_terms on a keyword dimension returns the right keys when the index has more than one segment: the star-tree
+     * holds each segment's own ordinals. Segment 1 holds only "b": its segment ordinal 0 is the global ordinal of "a",
+     * and its documents count under "b".
+     */
+    public void testKeywordDimensionWithMultipleSegments() throws IOException {
+        try (Directory directory = newDirectory()) {
+            IndexWriterConfig conf = new IndexWriterConfig();
+            conf.setCodec(getCodec());
+            conf.setMergePolicy(NoMergePolicy.INSTANCE);
+            try (IndexWriter iw = new IndexWriter(directory, conf)) {
+                iw.addDocument(doc("a", 1, 10.0f, 100.0));
+                iw.addDocument(doc("b", 1, 10.0f, 200.0));
+                iw.commit();
+                iw.addDocument(doc("b", 1, 10.0f, 300.0));
+                iw.addDocument(doc("b", 2, 20.0f, 400.0));
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                assertEquals(2, reader.leaves().size());
+                testCase(
+                    newSearcher(wrapInMockESDirectoryReader(reader), false, false),
+                    new MatchAllDocsQuery(),
+                    null,
+                    new MultiTermsAggregationBuilder("_name").terms(getSourceConfig(KEYWORD_FIELD, INT_FIELD))
+                        .subAggregation(max("max_metric").field(METRIC_FIELD)),
+                    getStarTree(reader),
+                    getSupportedDimensions()
+                );
+            }
+        }
+    }
+
+    private static CompositeIndexFieldInfo getStarTree(DirectoryReader reader) {
+        SegmentReader segmentReader = Lucene.segmentReader(reader.leaves().get(0).reader());
+        return ((CompositeIndexReader) segmentReader.getDocValuesReader()).getCompositeIndexFields().get(0);
+    }
+
+    private static LinkedHashMap<Dimension, MappedFieldType> getSupportedDimensions() {
+        LinkedHashMap<Dimension, MappedFieldType> supportedDimensions = new LinkedHashMap<>();
+        supportedDimensions.put(new OrdinalDimension(KEYWORD_FIELD), KEYWORD_FIELD_TYPE);
+        supportedDimensions.put(new NumericDimension(INT_FIELD), INT_FIELD_TYPE);
+        supportedDimensions.put(new NumericDimension(FLOAT_FIELD), FLOAT_FIELD_TYPE);
+        return supportedDimensions;
     }
 
     /**
