@@ -210,7 +210,13 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
         NumberFieldType numberFieldType = (NumberFieldType) mappedFieldType;
         List<Object> convertedValues = new ArrayList<>(rawValues.size());
         for (Object rawValue : rawValues) {
-            convertedValues.add(numberFieldType.numberType().parse(rawValue, true).longValue());
+            // As on the regular path, a value with a decimal part matches no value of an integer-type field
+            if (hasDecimalPart(rawValue) == false) {
+                convertedValues.add(numberFieldType.numberType().parse(rawValue, true).longValue());
+            }
+        }
+        if (convertedValues.isEmpty()) {
+            return new MatchNoneFilter();
         }
         return new ExactMatchDimFilter(mappedFieldType.name(), convertedValues);
     }
@@ -226,17 +232,18 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
             ? defaultMaximum()
             : numberFieldType.numberType().parse(rangeQuery.to(), true).longValue();
 
-        boolean lowerTermHasDecimalPart = hasDecimalPart(parsedLow);
+        // The decimal part is checked on the bound as given, since parsing it truncates it
+        boolean lowerTermHasDecimalPart = rangeQuery.from() != null && hasDecimalPart(rangeQuery.from());
         if ((lowerTermHasDecimalPart == false && rangeQuery.includeLower() == false)
-            || (lowerTermHasDecimalPart && signum(parsedLow) > 0)) {
+            || (lowerTermHasDecimalPart && signum(rangeQuery.from()) > 0)) {
             if (parsedLow.equals(defaultMaximum())) {
                 return new MatchNoneFilter();
             }
             ++parsedLow;
         }
-        boolean upperTermHasDecimalPart = hasDecimalPart(parsedHigh);
+        boolean upperTermHasDecimalPart = rangeQuery.to() != null && hasDecimalPart(rangeQuery.to());
         if ((upperTermHasDecimalPart == false && rangeQuery.includeUpper() == false)
-            || (upperTermHasDecimalPart && signum(parsedHigh) < 0)) {
+            || (upperTermHasDecimalPart && signum(rangeQuery.to()) < 0)) {
             if (parsedHigh.equals(defaultMinimum())) {
                 return new MatchNoneFilter();
             }

@@ -19,10 +19,13 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.MatchNoDocsQuery;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
+import org.opensearch.common.Numbers;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.common.util.io.IOUtils;
@@ -30,8 +33,10 @@ import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
 import org.opensearch.index.codec.composite.composite104.Composite104Codec;
 import org.opensearch.index.codec.composite912.datacube.startree.StarTreeDocValuesFormatTests;
+import org.opensearch.index.compositeindex.datacube.Dimension;
 import org.opensearch.index.compositeindex.datacube.Metric;
 import org.opensearch.index.compositeindex.datacube.MetricStat;
+import org.opensearch.index.compositeindex.datacube.NumericDimension;
 import org.opensearch.index.compositeindex.datacube.OrdinalDimension;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeField;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeFieldConfiguration;
@@ -39,6 +44,7 @@ import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValue
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedSetStarTreeValuesIterator;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.StarTreeValuesIterator;
+import org.opensearch.index.document.SortedUnsignedLongDocValuesRangeQuery;
 import org.opensearch.index.mapper.CompositeDataCubeFieldType;
 import org.opensearch.index.mapper.IpFieldMapper;
 import org.opensearch.index.mapper.KeywordFieldMapper;
@@ -49,6 +55,7 @@ import org.opensearch.index.mapper.StarTreeMapper;
 import org.opensearch.index.mapper.WildcardFieldMapper;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
@@ -59,6 +66,7 @@ import org.opensearch.search.startree.StarTreeTraversalUtil;
 import org.opensearch.search.startree.filter.DimensionFilter;
 import org.opensearch.search.startree.filter.DimensionFilter.MatchType;
 import org.opensearch.search.startree.filter.MatchNoneFilter;
+import org.opensearch.search.startree.filter.RangeMatchDimFilter;
 import org.opensearch.search.startree.filter.StarTreeFilter;
 import org.opensearch.search.startree.filter.provider.DimensionFilterMapper;
 import org.opensearch.search.startree.filter.provider.StarTreeFilterProvider;
@@ -75,6 +83,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -455,5 +465,174 @@ public class DimensionFilterAndMapperTests extends OpenSearchTestCase {
     private static StarTreeFilter starTreeFilter(SearchContext searchContext, QueryBuilder query, CompositeDataCubeFieldType starTree)
         throws IOException {
         return StarTreeFilterProvider.SingletonFactory.getProvider(query).getFilter(searchContext, query, starTree);
+    }
+
+    /**
+     * A decimal bound on an integer-type dimension is rounded inward, as on the regular path: {@code gte 4.5} starts at 5,
+     * {@code gt -4.5} at -4, {@code lte -4.5} ends at -5 and {@code lt 4.5} at 4. The decimal part and its sign are looked
+     * for on the bound as given, before parsing truncates it: {@code gte 0.5} starts at 1 and {@code lte -0.5} ends at -1,
+     * though both truncate to 0. The star-tree answers each range, on every integer type; unsigned_long takes the
+     * non-negative bounds.
+     */
+    public void testDecimalRangeBoundsOnIntegerDimensionsMatchTheRegularPath() throws IOException {
+        QueryShardContext queryShardContext = mock(QueryShardContext.class);
+        List<Query> regularPath = new ArrayList<>();
+        List<Query> starTreePath = new ArrayList<>();
+        for (NumberFieldMapper.NumberType type : List.of(
+            NumberFieldMapper.NumberType.BYTE,
+            NumberFieldMapper.NumberType.SHORT,
+            NumberFieldMapper.NumberType.INTEGER,
+            NumberFieldMapper.NumberType.LONG,
+            NumberFieldMapper.NumberType.UNSIGNED_LONG
+        )) {
+            boolean unsigned = type == NumberFieldMapper.NumberType.UNSIGNED_LONG;
+            // Doc values only, so that the regular path's query is a plain range over its inclusive bounds
+            NumberFieldMapper.NumberFieldType fieldType = new NumberFieldMapper.NumberFieldType(
+                type.typeName(),
+                type,
+                false,
+                false,
+                true,
+                false,
+                true,
+                null,
+                Collections.emptyMap()
+            );
+            SearchContext searchContext = searchContext(fieldType);
+            CompositeDataCubeFieldType starTree = starTree(starTreeField(new NumericDimension(fieldType.name())));
+            List<RangeQueryBuilder> rangeQueries = new ArrayList<>();
+            for (double bound : unsigned ? List.of(4.5, 0.5) : List.of(4.5, 0.5, -0.5, -4.5)) {
+                rangeQueries.add(new RangeQueryBuilder(fieldType.name()).gte(bound));
+                rangeQueries.add(new RangeQueryBuilder(fieldType.name()).gt(bound));
+                rangeQueries.add(new RangeQueryBuilder(fieldType.name()).lte(bound));
+                rangeQueries.add(new RangeQueryBuilder(fieldType.name()).lt(bound));
+            }
+            for (RangeQueryBuilder rangeQuery : rangeQueries) {
+                regularPath.add(
+                    fieldType.rangeQuery(
+                        rangeQuery.from(),
+                        rangeQuery.to(),
+                        rangeQuery.includeLower(),
+                        rangeQuery.includeUpper(),
+                        queryShardContext
+                    )
+                );
+                StarTreeFilter filter = starTreeFilter(searchContext, rangeQuery, starTree);
+                assertNotNull(rangeQuery.toString(), filter);
+                RangeMatchDimFilter range = (RangeMatchDimFilter) filter.getFiltersForDimension(fieldType.name()).getFirst();
+                starTreePath.add(
+                    unsigned ? unsignedDocValuesRangeQuery(fieldType.name(), range) : docValuesRangeQuery(fieldType.name(), range)
+                );
+            }
+        }
+        assertEquals(regularPath, starTreePath);
+    }
+
+    /**
+     * A term with a decimal part on an integer-type dimension matches no value, as on the regular path: {@code term 5.5}
+     * matches nothing and {@code terms [5.5, 7]} only 7, rather than the term truncated to 5, on every integer type.
+     */
+    public void testDecimalTermsOnIntegerDimensionsMatchLikeTheRegularPath() throws IOException {
+        Map<String, Set<Long>> regularPath = new LinkedHashMap<>();
+        Map<String, Set<Long>> starTreePath = new LinkedHashMap<>();
+        for (NumberFieldMapper.NumberType type : List.of(
+            NumberFieldMapper.NumberType.BYTE,
+            NumberFieldMapper.NumberType.SHORT,
+            NumberFieldMapper.NumberType.INTEGER,
+            NumberFieldMapper.NumberType.LONG,
+            NumberFieldMapper.NumberType.UNSIGNED_LONG
+        )) {
+            NumberFieldMapper.NumberFieldType fieldType = new NumberFieldMapper.NumberFieldType(type.typeName(), type);
+            assertTrue(fieldType.termQuery(5.5, null) instanceof MatchNoDocsQuery);
+            SearchContext searchContext = searchContext(fieldType);
+            StarTreeField starTreeField = starTreeField(new NumericDimension(fieldType.name()));
+
+            String term = type.typeName() + " term 5.5";
+            regularPath.put(term, Set.of());
+            QueryBuilder termQuery = new TermQueryBuilder(fieldType.name(), 5.5);
+            starTreePath.put(term, matchedValues(termQuery, regularPath.get(term), searchContext, starTreeField));
+            String terms = type.typeName() + " terms [5.5, 7]";
+            regularPath.put(terms, Set.of(7L));
+            QueryBuilder termsQuery = new TermsQueryBuilder(fieldType.name(), List.of(5.5, 7));
+            starTreePath.put(terms, matchedValues(termsQuery, regularPath.get(terms), searchContext, starTreeField));
+        }
+        assertEquals(regularPath, starTreePath);
+    }
+
+    /**
+     * The values from 4 to 8 that the star-tree matches for {@code query} on the one numeric dimension of {@code starTreeField}.
+     * A query the provider declines runs on the regular path, which matches {@code regularPath}.
+     */
+    private static Set<Long> matchedValues(
+        QueryBuilder query,
+        Set<Long> regularPath,
+        SearchContext searchContext,
+        StarTreeField starTreeField
+    ) throws IOException {
+        StarTreeFilter filter = starTreeFilter(searchContext, query, starTree(starTreeField));
+        if (filter == null) {
+            return regularPath;
+        }
+        List<DimensionFilter> filters = filter.getFiltersForDimension(starTreeField.getDimensionsOrder().getFirst().getField());
+        // A dimension without filters would not be filtered at all
+        assertFalse(query.toString(), filters == null || filters.isEmpty());
+        StarTreeValues segment = mock(StarTreeValues.class);
+        when(segment.getStarTreeField()).thenReturn(starTreeField);
+        Set<Long> matched = new TreeSet<>();
+        for (DimensionFilter dimensionFilter : filters) {
+            dimensionFilter.initialiseForSegment(segment, searchContext);
+            for (long value = 4; value <= 8; value++) {
+                if (dimensionFilter.matchDimValue(value, segment)) {
+                    matched.add(value);
+                }
+            }
+        }
+        return matched;
+    }
+
+    /** The doc values range query over the values a star-tree range filter matches, to compare with the regular path's query. */
+    private static Query docValuesRangeQuery(String field, RangeMatchDimFilter range) {
+        long low = ((Number) range.getLow()).longValue();
+        long high = ((Number) range.getHigh()).longValue();
+        return SortedNumericDocValuesField.newSlowRangeQuery(
+            field,
+            range.isIncludeLow() ? low : low + 1,
+            range.isIncludeHigh() ? high : high - 1
+        );
+    }
+
+    /** The unsigned_long doc values range query over the values a star-tree range filter matches, as {@link #docValuesRangeQuery}. */
+    private static Query unsignedDocValuesRangeQuery(String field, RangeMatchDimFilter range) {
+        long low = ((Number) range.getLow()).longValue();
+        long high = ((Number) range.getHigh()).longValue();
+        return SortedUnsignedLongDocValuesRangeQuery.newSlowRangeQuery(
+            field,
+            Numbers.toUnsignedBigInteger(range.isIncludeLow() ? low : low + 1),
+            Numbers.toUnsignedBigInteger(range.isIncludeHigh() ? high : high - 1)
+        );
+    }
+
+    private static StarTreeField starTreeField(Dimension... dimensions) {
+        return new StarTreeField(
+            "star_tree",
+            List.of(dimensions),
+            List.of(new Metric("field", List.of(MetricStat.MAX))),
+            new StarTreeFieldConfiguration(1, Collections.emptySet(), StarTreeFieldConfiguration.StarTreeBuildMode.ON_HEAP)
+        );
+    }
+
+    private static CompositeDataCubeFieldType starTree(StarTreeField starTreeField) {
+        return new StarTreeMapper.StarTreeFieldType("star_tree", starTreeField);
+    }
+
+    /** A search context whose mapping has the given fields. */
+    private static SearchContext searchContext(MappedFieldType... fieldTypes) {
+        MapperService mapperService = mock(MapperService.class);
+        SearchContext searchContext = mock(SearchContext.class);
+        when(searchContext.mapperService()).thenReturn(mapperService);
+        for (MappedFieldType fieldType : fieldTypes) {
+            when(mapperService.fieldType(fieldType.name())).thenReturn(fieldType);
+        }
+        return searchContext;
     }
 }
