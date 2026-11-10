@@ -368,6 +368,10 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
                     long dimensionValue = starTreeDateRoundingRequired
                         ? preparedRounding.round(valuesIterator.nextValue())
                         : valuesIterator.nextValue();
+                    // As collectValue, skip the buckets outside the hard bounds
+                    if (hardBounds != null && hardBounds.contain(dimensionValue) == false) {
+                        continue;
+                    }
 
                     if (docCountsIterator.advanceExact(starTreeEntry)) {
                         long metricValue = docCountsIterator.nextValue();

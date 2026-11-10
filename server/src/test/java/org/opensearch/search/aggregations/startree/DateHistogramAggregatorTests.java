@@ -66,6 +66,7 @@ import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregat
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
+import org.opensearch.search.aggregations.bucket.histogram.LongBounds;
 import org.opensearch.search.aggregations.bucket.terms.InternalTerms;
 import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
@@ -978,6 +979,53 @@ public class DateHistogramAggregatorTests extends DateHistogramAggregatorTestCas
                 null,
                 histogram(DateHistogramInterval.DAY).timeZone(ZoneId.of("+05:45")).minDocCount(1),
                 Map.of("1970-01-10T00:00:00.000+05:45", 2L, "1970-01-11T00:00:00.000+05:45", 1L, "1970-01-12T00:00:00.000+05:45", 1L)
+            );
+        }
+    }
+
+    /**
+     * A date_histogram with hard bounds gets, from the star-tree, only the buckets within the bounds, as the default
+     * aggregation does: the bucket keyed on the lower bound is kept, the one keyed on the upper bound is not. On an interval of
+     * the star-tree, day, and on a coarser one, quarter, whose buckets the star-tree computes by rounding its months: the
+     * second and third quarters are kept, the first and fourth are not.
+     */
+    public void testDateHistogramWithHardBounds() throws IOException {
+        try (
+            StarTreeSegment segment = indexStarTreeSegment(
+                MONTH_AND_DAY,
+                "1970-01-07T12:00:00Z",
+                "1970-01-08T00:00:00Z",
+                "1970-01-10T12:00:00Z",
+                "1970-01-15T12:00:00Z",
+                "1970-01-16T00:00:00Z",
+                "1970-01-20T12:00:00Z",
+                "1970-03-31T12:00:00Z",
+                "1970-04-01T00:00:00Z",
+                "1970-09-30T12:00:00Z",
+                "1970-10-01T00:00:00Z"
+            )
+        ) {
+            DateHistogramAggregationBuilder days = histogram(DateHistogramInterval.DAY).hardBounds(
+                new LongBounds(epochMillis("1970-01-08"), epochMillis("1970-01-16"))
+            );
+            assertTrue(searchUsesStarTree(segment, new MatchAllDocsQuery(), null, days));
+            assertStarTreeMatchesDefault(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                days,
+                Map.of("1970-01-08T00:00:00.000Z", 1L, "1970-01-10T00:00:00.000Z", 1L, "1970-01-15T00:00:00.000Z", 1L)
+            );
+            DateHistogramAggregationBuilder quarters = histogram(DateHistogramInterval.QUARTER).hardBounds(
+                new LongBounds(epochMillis("1970-04-01"), epochMillis("1970-10-01"))
+            );
+            assertTrue(searchUsesStarTree(segment, new MatchAllDocsQuery(), null, quarters));
+            assertStarTreeMatchesDefault(
+                segment,
+                new MatchAllDocsQuery(),
+                null,
+                quarters,
+                Map.of("1970-04-01T00:00:00.000Z", 1L, "1970-07-01T00:00:00.000Z", 1L)
             );
         }
     }
