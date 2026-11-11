@@ -47,7 +47,7 @@ import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
 import org.opensearch.index.fielddata.FieldData;
-import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.mapper.FieldValueConverter;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -217,9 +217,7 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
                 // Only numeric & floating points are supported as of now in star-tree
                 // TODO: Add support for isBigInteger() when it gets supported in star-tree
                 if (valuesSource.isFloatingPoint()) {
-                    double doubleValue = ((NumberFieldMapper.NumberFieldType) context.mapperService().fieldType(fieldName)).toDoubleValue(
-                        dimensionValue
-                    );
+                    double doubleValue = ((FieldValueConverter) context.mapperService().fieldType(fieldName)).toDoubleValue(dimensionValue);
                     dimensionValue = NumericUtils.doubleToSortableLong(doubleValue);
                 }
                 if (longFilter != null && longFilter.accept(dimensionValue) == false) {

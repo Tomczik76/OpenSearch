@@ -30,7 +30,7 @@ import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.Sort
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.StarTreeValuesIterator;
 import org.opensearch.index.fielddata.SortedBinaryDocValues;
 import org.opensearch.index.fielddata.SortedNumericDoubleValues;
-import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.mapper.FieldValueConverter;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -460,9 +460,9 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
                 });
             } else if (vs instanceof ValuesSource.Numeric numericSource) {
                 if (numericSource.isFloatingPoint()) {
-                    NumberFieldMapper.NumberFieldType numberFieldType = ((NumberFieldMapper.NumberFieldType) context.mapperService()
-                        .fieldType(fieldName));
-                    termValueBuilders.add(val -> TermValue.of(numberFieldType.toDoubleValue(val)));
+                    // Every numeric field type a dimension can have converts its stored long, scaled_float included
+                    FieldValueConverter converter = (FieldValueConverter) context.mapperService().fieldType(fieldName);
+                    termValueBuilders.add(val -> TermValue.of(converter.toDoubleValue(val)));
                 } else if (numericSource.isBigInteger()) {
                     // As on the regular path, an unsigned_long is keyed by its unsigned value, not the signed long holding it
                     termValueBuilders.add(val -> TermValue.of(Numbers.toUnsignedBigInteger(val)));

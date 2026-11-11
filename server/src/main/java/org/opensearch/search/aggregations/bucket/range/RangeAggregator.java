@@ -53,7 +53,7 @@ import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValue
 import org.opensearch.index.compositeindex.datacube.startree.utils.StarTreeUtils;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
 import org.opensearch.index.fielddata.SortedNumericDoubleValues;
-import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.mapper.FieldValueConverter;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -447,7 +447,7 @@ public class RangeAggregator extends BucketsAggregator implements StarTreePreCom
                     double dimensionValue;
 
                     if (valuesSource.isFloatingPoint()) {
-                        dimensionValue = ((NumberFieldMapper.NumberFieldType) context.mapperService().fieldType(fieldName)).toDoubleValue(
+                        dimensionValue = ((FieldValueConverter) context.mapperService().fieldType(fieldName)).toDoubleValue(
                             dimensionLongValue
                         );
                     } else if (valuesSource.isBigInteger()) {
