@@ -56,7 +56,9 @@ public class StarTreeQueryHelper {
         // or keep only one slice's documents
             && context.minimumScore() == null
             && context.terminateAfter() == SearchContext.DEFAULT_TERMINATE_AFTER
-            && (context.request() == null || context.request().source() == null || context.request().source().slice() == null);
+            && (context.request() == null || context.request().source() == null || context.request().source().slice() == null)
+            // Stream search's aggregators flush per segment and do not pre-compute with the star-tree
+            && context.isStreamSearch() == false;
     }
 
     public static CompositeIndexFieldInfo getSupportedStarTree(QueryShardContext context) {
