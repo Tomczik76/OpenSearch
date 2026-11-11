@@ -1908,7 +1908,8 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
                 u = objectToUnsignedLong(upperTerm, true);
                 boolean upperTermHasDecimalPart = hasDecimalPart(upperTerm);
                 if ((upperTermHasDecimalPart == false && includeUpper == false) || (upperTermHasDecimalPart && signum(upperTerm) < 0)) {
-                    if (u.compareTo(Numbers.MAX_UNSIGNED_LONG_VALUE) == 0) {
+                    // Nothing is below the type's minimum, as for the signed types
+                    if (u.compareTo(Numbers.MIN_UNSIGNED_LONG_VALUE) == 0) {
                         return new MatchNoDocsQuery();
                     }
                     u = u.subtract(BigInteger.ONE);
