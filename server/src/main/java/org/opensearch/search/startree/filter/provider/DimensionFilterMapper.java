@@ -26,6 +26,7 @@ import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.NumberFieldMapper.NumberFieldType;
+import org.opensearch.index.mapper.NumberFieldMapper.NumberType;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.startree.filter.DimensionFilter;
 import org.opensearch.search.startree.filter.ExactMatchDimFilter;
@@ -210,7 +211,13 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
         NumberFieldType numberFieldType = (NumberFieldType) mappedFieldType;
         List<Object> convertedValues = new ArrayList<>(rawValues.size());
         for (Object rawValue : rawValues) {
-            convertedValues.add(numberFieldType.numberType().parse(rawValue, true).longValue());
+            // As on the regular path, a value with a decimal part matches no value of an integer-type field
+            if (hasDecimalPart(rawValue) == false) {
+                convertedValues.add(queryType(numberFieldType).parse(rawValue, true).longValue());
+            }
+        }
+        if (convertedValues.isEmpty()) {
+            return new MatchNoneFilter();
         }
         return new ExactMatchDimFilter(mappedFieldType.name(), convertedValues);
     }
@@ -219,30 +226,38 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
     public DimensionFilter getRangeMatchFilter(MappedFieldType mappedFieldType, StarTreeRangeQuery rangeQuery) {
         NumberFieldType numberFieldType = (NumberFieldType) mappedFieldType;
 
-        Long parsedLow = rangeQuery.from() == null
-            ? defaultMinimum()
-            : numberFieldType.numberType().parse(rangeQuery.from(), true).longValue();
-        Long parsedHigh = rangeQuery.to() == null
-            ? defaultMaximum()
-            : numberFieldType.numberType().parse(rangeQuery.to(), true).longValue();
-
-        boolean lowerTermHasDecimalPart = hasDecimalPart(parsedLow);
-        if ((lowerTermHasDecimalPart == false && rangeQuery.includeLower() == false)
-            || (lowerTermHasDecimalPart && signum(parsedLow) > 0)) {
-            if (parsedLow.equals(defaultMaximum())) {
-                return new MatchNoneFilter();
+        long parsedLow = defaultMinimum();
+        long parsedHigh = defaultMaximum();
+        // As on the regular path, only a given bound is made inclusive: a null bound is no bound, even an exclusive one.
+        // The decimal part is checked on the bound as given, since parsing it truncates it.
+        if (rangeQuery.from() != null) {
+            parsedLow = queryType(numberFieldType).parse(rangeQuery.from(), true).longValue();
+            boolean lowerTermHasDecimalPart = hasDecimalPart(rangeQuery.from());
+            if ((lowerTermHasDecimalPart == false && rangeQuery.includeLower() == false)
+                || (lowerTermHasDecimalPart && signum(rangeQuery.from()) > 0)) {
+                if (parsedLow == defaultMaximum()) {
+                    return new MatchNoneFilter();
+                }
+                ++parsedLow;
             }
-            ++parsedLow;
         }
-        boolean upperTermHasDecimalPart = hasDecimalPart(parsedHigh);
-        if ((upperTermHasDecimalPart == false && rangeQuery.includeUpper() == false)
-            || (upperTermHasDecimalPart && signum(parsedHigh) < 0)) {
-            if (parsedHigh.equals(defaultMinimum())) {
-                return new MatchNoneFilter();
+        if (rangeQuery.to() != null) {
+            parsedHigh = queryType(numberFieldType).parse(rangeQuery.to(), true).longValue();
+            boolean upperTermHasDecimalPart = hasDecimalPart(rangeQuery.to());
+            if ((upperTermHasDecimalPart == false && rangeQuery.includeUpper() == false)
+                || (upperTermHasDecimalPart && signum(rangeQuery.to()) < 0)) {
+                if (parsedHigh == defaultMinimum()) {
+                    return new MatchNoneFilter();
+                }
+                --parsedHigh;
             }
-            --parsedHigh;
         }
         return new RangeMatchDimFilter(mappedFieldType.name(), parsedLow, parsedHigh, true, true);
+    }
+
+    /** The type the regular path parses the terms and bounds of a query on the dimension as. */
+    NumberType queryType(NumberFieldType numberFieldType) {
+        return numberFieldType.numberType();
     }
 
     abstract Long defaultMinimum();
@@ -252,6 +267,12 @@ abstract class NumericNonDecimalMapper extends NumericMapper {
 }
 
 class IntegerFieldMapperNumeric extends NumericNonDecimalMapper {
+    /** Byte and short fields are queried as integers, so a value outside their range matches nothing rather than failing. */
+    @Override
+    NumberType queryType(NumberFieldType numberFieldType) {
+        return INTEGER;
+    }
+
     @Override
     Long defaultMinimum() {
         return (long) Integer.MIN_VALUE;
@@ -300,21 +321,6 @@ class UnsignedLongFieldMapperNumeric extends NumericNonDecimalMapper {
         return Long.compareUnsigned((Long) v1, (Long) v2);
     }
 
-    @Override
-    public boolean isValueInRange(Object value, Object low, Object high, boolean includeLow, boolean includeHigh) {
-        long v = (Long) value;
-        long l = low != null ? (Long) low : 0L;
-        long h = high != null ? (Long) high : -1L; // -1L is max unsigned
-
-        if (Long.compareUnsigned(l, h) > 0) {
-            return (Long.compareUnsigned(v, l) > 0 || (Long.compareUnsigned(v, l) == 0 && includeLow))
-                || (Long.compareUnsigned(v, h) < 0 || (Long.compareUnsigned(v, h) == 0 && includeHigh));
-        }
-
-        // Normal case
-        return super.isValueInRange(value, low, high, includeLow, includeHigh);
-    }
-
 }
 
 abstract class NumericDecimalFieldMapper extends NumericMapper {
@@ -336,19 +342,25 @@ abstract class NumericDecimalFieldMapper extends NumericMapper {
         Number u = Long.MAX_VALUE;
         if (rangeQuery.from() != null) {
             l = numberFieldType.numberType().parse(rangeQuery.from(), false);
-            if (rangeQuery.includeLower() == false) {
-                l = getNextHigh(l);
-            }
+            l = rangeQuery.includeLower() ? getInclusiveLow(l) : getNextHigh(l);
             l = convertToDocValues(l);
         }
         if (rangeQuery.to() != null) {
             u = numberFieldType.numberType().parse(rangeQuery.to(), false);
-            if (rangeQuery.includeUpper() == false) {
-                u = getNextLow(u);
-            }
+            u = rangeQuery.includeUpper() ? getInclusiveHigh(u) : getNextLow(u);
             u = convertToDocValues(u);
         }
         return new RangeMatchDimFilter(numberFieldType.name(), l, u, true, true);
+    }
+
+    /** The inclusive lower bound of a range from {@code parsedValue} included, by default the value itself. */
+    Number getInclusiveLow(Number parsedValue) {
+        return parsedValue;
+    }
+
+    /** The inclusive upper bound of a range to {@code parsedValue} included, by default the value itself. */
+    Number getInclusiveHigh(Number parsedValue) {
+        return parsedValue;
     }
 
     abstract long convertToDocValues(Number parsedValue);
@@ -363,6 +375,18 @@ class HalfFloatFieldMapperNumeric extends NumericDecimalFieldMapper {
     @Override
     long convertToDocValues(Number parsedValue) {
         return HalfFloatPoint.halfFloatToSortableShort((Float) parsedValue);
+    }
+
+    /** As on the regular path, a bound between two half floats is rounded up to the next one, not to the nearest. */
+    @Override
+    Number getInclusiveLow(Number parsedValue) {
+        return HalfFloatPoint.nextUp(HalfFloatPoint.nextDown((Float) parsedValue));
+    }
+
+    /** As on the regular path, a bound between two half floats is rounded down to the previous one, not to the nearest. */
+    @Override
+    Number getInclusiveHigh(Number parsedValue) {
+        return HalfFloatPoint.nextDown(HalfFloatPoint.nextUp((Float) parsedValue));
     }
 
     @Override
@@ -523,6 +547,16 @@ class KeywordFieldMapper extends OrdinalFieldMapper {
  * objects into sortable {@link BytesRef}.
  */
 class IpFieldMapper extends OrdinalFieldMapper {
+
+    @Override
+    public DimensionFilter getExactMatchFilter(MappedFieldType mappedFieldType, List<Object> rawValues) {
+        for (Object rawValue : rawValues) {
+            if (rawValue instanceof String s && s.contains("/")) {
+                return null; // A CIDR block matches a prefix of addresses, not one address: the regular path answers it
+            }
+        }
+        return super.getExactMatchFilter(mappedFieldType, rawValues);
+    }
 
     /**
      * Parses a raw IP address value into a sortable {@link BytesRef}.

@@ -138,8 +138,12 @@ public class BoolStarTreeFilterProvider implements StarTreeFilterProvider {
                         return null; // No possible matches after merging
                     }
                     // Each intersection resolves on its own calendar interval, and the traversal reads a dimension's
-                    // filters on one interval: bring them to the finest, as for SHOULD clauses
-                    dimensionToFilters.put(dimension, mapper.getFinalDimensionFilters(intersectedFilters));
+                    // filters on one interval: bring them to one that resolves all of them, as for SHOULD clauses
+                    List<DimensionFilter> finalFilters = mapper.getFinalDimensionFilters(intersectedFilters);
+                    if (finalFilters == null) {
+                        return null; // No calendar interval resolves the filters
+                    }
+                    dimensionToFilters.put(dimension, finalFilters);
                 }
             }
         }
@@ -191,7 +195,11 @@ public class BoolStarTreeFilterProvider implements StarTreeFilterProvider {
             context.mapperService().fieldType(commonDimension),
             context
         );
-        return new StarTreeFilter(Map.of(commonDimension, mapper.getFinalDimensionFilters(dimensionToFilters.get(commonDimension))));
+        List<DimensionFilter> finalFilters = mapper.getFinalDimensionFilters(dimensionToFilters.get(commonDimension));
+        if (finalFilters == null) {
+            return null; // No calendar interval resolves the filters
+        }
+        return new StarTreeFilter(Map.of(commonDimension, finalFilters));
     }
 
     private List<QueryBuilder> getCombinedMustAndFilterClauses(BoolQueryBuilder boolQuery) {

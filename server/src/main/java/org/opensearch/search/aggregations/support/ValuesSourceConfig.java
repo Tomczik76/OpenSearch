@@ -395,6 +395,14 @@ public class ValuesSourceConfig {
         return this.scriptValueType;
     }
 
+    /**
+     * Returns whether a {@code value_type} makes the aggregation read its field as another values source type than the
+     * field's own, such as a numeric field as strings.
+     */
+    public boolean readsFieldAsAnotherType() {
+        return fieldContext != null && scriptValueType != null && valuesSourceType != fieldContext.indexFieldData().getValuesSourceType();
+    }
+
     public Object missing() {
         return this.missing;
     }

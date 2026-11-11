@@ -29,6 +29,7 @@ import org.opensearch.search.startree.StarTreeQueryHelper;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder.REGISTRY_KEY;
@@ -168,6 +169,28 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
 
     public List<String> getRequestFields() {
         return requestFields;
+    }
+
+    /**
+     * Returns whether any term has an include or exclude filter.
+     */
+    public boolean filtersTerms() {
+        return configs.stream().map(Tuple::v2).anyMatch(Objects::nonNull);
+    }
+
+    /**
+     * Returns whether every term reads its field's values as they are indexed: no {@code missing} value or script changes
+     * them at read time, and no {@code value_type} reads them as another type.
+     */
+    public boolean readsIndexedFieldValues() {
+        return configs.stream()
+            .map(Tuple::v1)
+            .allMatch(
+                config -> config.fieldContext() != null
+                    && config.missing() == null
+                    && config.script() == null
+                    && config.readsFieldAsAnotherType() == false
+            );
     }
 
     /**

@@ -18,8 +18,10 @@ import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -43,6 +45,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.terms.InternalMultiTerms;
 import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
@@ -63,6 +66,7 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
     private static final String INT_FIELD = "int";
     private static final String FLOAT_FIELD = "float";
     private static final String METRIC_FIELD = "metric";
+    private static final String UNSIGNED_FIELD = "unsigned";
 
     private static final MappedFieldType KEYWORD_FIELD_TYPE = new KeywordFieldMapper.KeywordFieldType(KEYWORD_FIELD);
     private static final MappedFieldType INT_FIELD_TYPE = new NumberFieldMapper.NumberFieldType(
@@ -171,6 +175,151 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
     }
 
     /**
+     * multi_terms on a keyword dimension returns the right keys when the index has more than one segment: the star-tree
+     * holds each segment's own ordinals. Segment 1 holds only "b": its segment ordinal 0 is the global ordinal of "a",
+     * and its documents count under "b".
+     */
+    public void testKeywordDimensionWithMultipleSegments() throws IOException {
+        try (Directory directory = newDirectory()) {
+            IndexWriterConfig conf = new IndexWriterConfig();
+            conf.setCodec(getCodec());
+            conf.setMergePolicy(NoMergePolicy.INSTANCE);
+            try (IndexWriter iw = new IndexWriter(directory, conf)) {
+                iw.addDocument(doc("a", 1, 10.0f, 100.0));
+                iw.addDocument(doc("b", 1, 10.0f, 200.0));
+                iw.commit();
+                iw.addDocument(doc("b", 1, 10.0f, 300.0));
+                iw.addDocument(doc("b", 2, 20.0f, 400.0));
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                assertEquals(2, reader.leaves().size());
+                testCase(
+                    newSearcher(wrapInMockESDirectoryReader(reader), false, false),
+                    new MatchAllDocsQuery(),
+                    null,
+                    new MultiTermsAggregationBuilder("_name").terms(getSourceConfig(KEYWORD_FIELD, INT_FIELD))
+                        .subAggregation(max("max_metric").field(METRIC_FIELD)),
+                    getStarTree(reader),
+                    getSupportedDimensions()
+                );
+            }
+        }
+    }
+
+    /**
+     * multi_terms with {@code collect_mode: breadth_first} and a sub-aggregation is answered by the star-tree: the
+     * star-tree pre-computes the sub-aggregations with their buckets, so they are not deferred.
+     */
+    public void testBreadthFirstWithSubAggregation() throws IOException {
+        try (Directory directory = newDirectory()) {
+            IndexWriterConfig conf = new IndexWriterConfig();
+            conf.setCodec(getCodec());
+            try (IndexWriter iw = new IndexWriter(directory, conf)) {
+                iw.addDocument(doc("a", 1, 10.0f, 100.0));
+                iw.addDocument(doc("a", 2, 20.0f, 200.0));
+                iw.addDocument(doc("b", 1, 10.0f, 300.0));
+                iw.addDocument(doc("b", 1, 10.0f, 400.0));
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                assertEquals(1, reader.leaves().size());
+                testCase(
+                    newSearcher(wrapInMockESDirectoryReader(reader), false, false),
+                    new MatchAllDocsQuery(),
+                    null,
+                    new MultiTermsAggregationBuilder("_name").terms(getSourceConfig(KEYWORD_FIELD, INT_FIELD))
+                        .collectMode(Aggregator.SubAggCollectionMode.BREADTH_FIRST)
+                        .subAggregation(max("max_metric").field(METRIC_FIELD)),
+                    getStarTree(reader),
+                    getSupportedDimensions()
+                );
+            }
+        }
+    }
+
+    /**
+     * multi_terms on an unsigned_long dimension keys its buckets by the unsigned values, as on the regular path: 2^63 and
+     * 2^64 - 1 are above 5, not negative, so the buckets are ordered 5, 2^63, 2^64 - 1 and a size of 2 keeps 5 and 2^63.
+     */
+    public void testUnsignedLongDimensionIsKeyedByItsUnsignedValues() throws IOException {
+        MappedFieldType unsignedFieldType = new NumberFieldMapper.NumberFieldType(
+            UNSIGNED_FIELD,
+            NumberFieldMapper.NumberType.UNSIGNED_LONG
+        );
+        try (Directory directory = newDirectory()) {
+            IndexWriterConfig conf = new IndexWriterConfig();
+            conf.setCodec(codec(unsignedLongMapping()));
+            try (IndexWriter iw = new IndexWriter(directory, conf)) {
+                // 5, 2^63 and 2^64 - 1 as their unsigned_long doc values
+                for (long value : new long[] { 5, Long.MIN_VALUE, -1 }) {
+                    Document doc = new Document();
+                    doc.add(new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")));
+                    doc.add(new SortedNumericDocValuesField(UNSIGNED_FIELD, value));
+                    iw.addDocument(doc);
+                }
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                IndexSearcher searcher = newSearcher(wrapInMockESDirectoryReader(reader), false, false);
+                LinkedHashMap<Dimension, MappedFieldType> dimensions = new LinkedHashMap<>();
+                dimensions.put(new OrdinalDimension(KEYWORD_FIELD), KEYWORD_FIELD_TYPE);
+                dimensions.put(new NumericDimension(UNSIGNED_FIELD), unsignedFieldType);
+                MultiTermsAggregationBuilder aggregation = new MultiTermsAggregationBuilder("_name").terms(
+                    getSourceConfig(KEYWORD_FIELD, UNSIGNED_FIELD)
+                ).size(2);
+                InternalMultiTerms starTreeAggregation = searchAndReduceStarTree(
+                    createIndexSettings(),
+                    searcher,
+                    new MatchAllDocsQuery(),
+                    null,
+                    aggregation,
+                    getStarTree(reader),
+                    dimensions,
+                    null,
+                    DEFAULT_MAX_BUCKETS,
+                    false,
+                    null,
+                    true,
+                    KEYWORD_FIELD_TYPE,
+                    unsignedFieldType
+                );
+                InternalMultiTerms defaultAggregation = searchAndReduceStarTree(
+                    createIndexSettings(),
+                    searcher,
+                    new MatchAllDocsQuery(),
+                    null,
+                    aggregation,
+                    null,
+                    null,
+                    null,
+                    DEFAULT_MAX_BUCKETS,
+                    false,
+                    null,
+                    false,
+                    KEYWORD_FIELD_TYPE,
+                    unsignedFieldType
+                );
+                assertEquals(
+                    List.of("a|5", "a|9223372036854775808"),
+                    defaultAggregation.getBuckets().stream().map(InternalMultiTerms.Bucket::getKeyAsString).toList()
+                );
+                assertEquals(defaultAggregation, starTreeAggregation);
+            }
+        }
+    }
+
+    private static CompositeIndexFieldInfo getStarTree(DirectoryReader reader) {
+        SegmentReader segmentReader = Lucene.segmentReader(reader.leaves().get(0).reader());
+        return ((CompositeIndexReader) segmentReader.getDocValuesReader()).getCompositeIndexFields().get(0);
+    }
+
+    private static LinkedHashMap<Dimension, MappedFieldType> getSupportedDimensions() {
+        LinkedHashMap<Dimension, MappedFieldType> supportedDimensions = new LinkedHashMap<>();
+        supportedDimensions.put(new OrdinalDimension(KEYWORD_FIELD), KEYWORD_FIELD_TYPE);
+        supportedDimensions.put(new NumericDimension(INT_FIELD), INT_FIELD_TYPE);
+        supportedDimensions.put(new NumericDimension(FLOAT_FIELD), FLOAT_FIELD_TYPE);
+        return supportedDimensions;
+    }
+
+    /**
      * Executes an aggregation twice: once with star-tree enabled and once with it disabled (default path),
      * then asserts that the results are identical.
      */
@@ -236,6 +385,42 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
         doc.add(new SortedNumericDocValuesField(FLOAT_FIELD, NumericUtils.floatToSortableInt(f)));
         doc.add(new SortedNumericDocValuesField(METRIC_FIELD, NumericUtils.doubleToSortableLong(metric)));
         return doc;
+    }
+
+    private static Codec codec(XContentBuilder mapping) throws IOException {
+        Logger testLogger = LogManager.getLogger(MultiTermsAggregatorTests.class);
+        return new Composite104Codec(Lucene104Codec.Mode.BEST_SPEED, StarTreeDocValuesFormatTests.createMapperService(mapping), testLogger);
+    }
+
+    /** A star-tree over a keyword and an unsigned_long dimension. */
+    private static XContentBuilder unsignedLongMapping() throws IOException {
+        return topMapping(b -> {
+            b.startObject("composite");
+            b.startObject("my_star_tree");
+            b.field("type", "star_tree");
+            b.startObject("config");
+            b.field("max_leaf_docs", 1);
+            b.startArray("ordered_dimensions");
+            b.startObject().field("name", KEYWORD_FIELD).endObject();
+            b.startObject().field("name", UNSIGNED_FIELD).endObject();
+            b.endArray();
+            b.startArray("metrics");
+            b.startObject();
+            b.field("name", METRIC_FIELD);
+            b.startArray("stats");
+            b.value("value_count");
+            b.endArray();
+            b.endObject();
+            b.endArray();
+            b.endObject();
+            b.endObject();
+            b.endObject();
+            b.startObject("properties");
+            b.startObject(KEYWORD_FIELD).field("type", "keyword").endObject();
+            b.startObject(UNSIGNED_FIELD).field("type", "unsigned_long").endObject();
+            b.startObject(METRIC_FIELD).field("type", "double").endObject();
+            b.endObject();
+        });
     }
 
     private static XContentBuilder getMapping() throws IOException {

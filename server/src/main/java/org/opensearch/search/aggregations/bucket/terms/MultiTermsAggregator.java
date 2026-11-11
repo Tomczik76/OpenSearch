@@ -30,7 +30,7 @@ import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.Sort
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.StarTreeValuesIterator;
 import org.opensearch.index.fielddata.SortedBinaryDocValues;
 import org.opensearch.index.fielddata.SortedNumericDoubleValues;
-import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.mapper.FieldValueConverter;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -62,6 +62,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.LongUnaryOperator;
 
 import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
 import static org.opensearch.search.aggregations.bucket.terms.TermsAggregator.descendsFromNestedAggregator;
@@ -446,9 +447,12 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
             ValuesSource vs = multiTermsValue.rawValueSources.get(i);
 
             if (vs instanceof ValuesSource.Bytes.WithOrdinals vsBytes) {
+                // The star-tree holds the segment's ordinals: map them to global ordinals before looking them up
+                SortedSetDocValues globalOrds = vsBytes.globalOrdinalsValues(ctx);
+                LongUnaryOperator globalOrdinalsMapping = vsBytes.globalOrdinalsMapping(ctx);
                 termValueBuilders.add(ord -> {
                     try {
-                        return TermValue.of(vsBytes.globalOrdinalsValues(ctx).lookupOrd(ord));
+                        return TermValue.of(globalOrds.lookupOrd(globalOrdinalsMapping.applyAsLong(ord)));
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
@@ -456,9 +460,12 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
                 });
             } else if (vs instanceof ValuesSource.Numeric numericSource) {
                 if (numericSource.isFloatingPoint()) {
-                    NumberFieldMapper.NumberFieldType numberFieldType = ((NumberFieldMapper.NumberFieldType) context.mapperService()
-                        .fieldType(fieldName));
-                    termValueBuilders.add(val -> TermValue.of(numberFieldType.toDoubleValue(val)));
+                    // Every numeric field type a dimension can have converts its stored long, scaled_float included
+                    FieldValueConverter converter = (FieldValueConverter) context.mapperService().fieldType(fieldName);
+                    termValueBuilders.add(val -> TermValue.of(converter.toDoubleValue(val)));
+                } else if (numericSource.isBigInteger()) {
+                    // As on the regular path, an unsigned_long is keyed by its unsigned value, not the signed long holding it
+                    termValueBuilders.add(val -> TermValue.of(Numbers.toUnsignedBigInteger(val)));
                 } else {
                     termValueBuilders.add(TermValue::of);
                 }
@@ -571,7 +578,10 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
 
     @Override
     protected boolean shouldDefer(Aggregator aggregator) {
-        return collectMode == Aggregator.SubAggCollectionMode.BREADTH_FIRST && !aggsUsedForSorting.contains(aggregator);
+        // The star-tree pre-computes the sub-aggregations with their buckets, as the terms aggregation does
+        return context.getQueryShardContext().getStarTreeQueryContext() == null
+            && collectMode == Aggregator.SubAggCollectionMode.BREADTH_FIRST
+            && !aggsUsedForSorting.contains(aggregator);
     }
 
     private void collectZeroDocEntriesIfNeeded(long owningBucketOrd) throws IOException {

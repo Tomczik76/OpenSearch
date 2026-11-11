@@ -62,10 +62,10 @@ class StarDateFieldMapper implements DimensionFilterMapper {
         String field = rangeQuery.fieldName();
         assert Objects.equals(dateDimension.getField(), rangeQuery.fieldName());
 
-        // Convert format string to DateMathParser if provided
+        // As on the regular path, the bounds are parsed with the query's format if it has one, else with the field's
         DateMathParser forcedDateParser = rangeQuery.format() != null
             ? DateFormatter.forPattern(rangeQuery.format()).toDateMathParser()
-            : org.opensearch.index.mapper.DateFieldMapper.getDefaultDateTimeFormatter().toDateMathParser();
+            : dateFieldType.dateTimeFormatter().toDateMathParser();
 
         ZoneId timeZone = rangeQuery.timeZone() != null ? ZoneId.of(rangeQuery.timeZone()) : null;
 
@@ -147,9 +147,13 @@ class StarDateFieldMapper implements DimensionFilterMapper {
         return true;
     }
 
+    /**
+     * Brings the filters to one calendar interval, which resolves the bounds of all: the finest of their intervals, or a finer
+     * one, since a week does not resolve the bounds of a month, quarter or year. Returns null if no interval resolves them.
+     */
     @Override
     public List<DimensionFilter> getFinalDimensionFilters(List<DimensionFilter> filters) {
-        if (filters == null || filters.size() <= 1) {
+        if (filters == null || filters.isEmpty()) {
             return filters;
         }
 
@@ -161,6 +165,13 @@ class StarDateFieldMapper implements DimensionFilterMapper {
                 needsFinalFilter = true;
                 lowestDimensionGranularity = granularity;
             }
+        }
+        while (lowestDimensionGranularity >= 0 && resolvesBounds(lowestDimensionGranularity, filters) == false) {
+            needsFinalFilter = true;
+            lowestDimensionGranularity--;
+        }
+        if (lowestDimensionGranularity < 0) {
+            return null;
         }
         // return the same filters if all filters have the same granularity
         if (needsFinalFilter == false) {
@@ -207,6 +218,30 @@ class StarDateFieldMapper implements DimensionFilterMapper {
             throw new IllegalArgumentException("Expected Long values for date comparison");
         }
         return Long.compare((Long) v1, (Long) v2);
+    }
+
+    // Whether the calendar interval of the sub-dimension resolves the bounds of every filter: a bound of a filter's window
+    // starts an interval, as in getRangeMatchFilter
+    private boolean resolvesBounds(int subDimension, List<DimensionFilter> filters) {
+        DateTimeUnitRounding interval = dateDimension.getSortedCalendarIntervals().get(subDimension);
+        for (DimensionFilter filter : filters) {
+            RangeMatchDimFilter rangeMatchDimFilter = (RangeMatchDimFilter) filter;
+            Long low = (Long) rangeMatchDimFilter.getLow();
+            if (low != null && low != Long.MIN_VALUE) {
+                long start = rangeMatchDimFilter.isIncludeLow() ? low : low + 1;
+                if (interval.roundFloor(start) != start) {
+                    return false;
+                }
+            }
+            Long high = (Long) rangeMatchDimFilter.getHigh();
+            if (high != null && high != Long.MAX_VALUE) {
+                long end = rangeMatchDimFilter.isIncludeHigh() ? high + 1 : high;
+                if (interval.roundFloor(end) != end) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     public String getSubDimensionFieldEffective(String subDimensionField1, String subDimensionField2) {

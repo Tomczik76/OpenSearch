@@ -330,6 +330,14 @@ public class TermsAggregatorFactory extends ValuesSourceAggregatorFactory implem
         }
     }
 
+    /**
+     * Returns whether the aggregation collects its terms in {@code map} execution mode, which does not pre-compute with
+     * the star-tree. Numeric terms ignore the execution hint.
+     */
+    public boolean collectsInMapMode() {
+        return ExecutionMode.MAP.toString().equals(executionHint) && config.getValuesSource() instanceof ValuesSource.Bytes;
+    }
+
     @Override
     protected Aggregator doCreateInternal(
         SearchContext searchContext,

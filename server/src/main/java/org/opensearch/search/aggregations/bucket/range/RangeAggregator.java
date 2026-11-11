@@ -36,6 +36,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.FixedBitSet;
+import org.opensearch.common.Numbers;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -52,7 +53,7 @@ import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValue
 import org.opensearch.index.compositeindex.datacube.startree.utils.StarTreeUtils;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
 import org.opensearch.index.fielddata.SortedNumericDoubleValues;
-import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.mapper.FieldValueConverter;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -445,12 +446,13 @@ public class RangeAggregator extends BucketsAggregator implements StarTreePreCom
                     long dimensionLongValue = valuesIterator.nextValue();
                     double dimensionValue;
 
-                    // Only numeric & floating points are supported as of now in star-tree
-                    // TODO: Add support for isBigInteger() when it gets supported in star-tree
                     if (valuesSource.isFloatingPoint()) {
-                        dimensionValue = ((NumberFieldMapper.NumberFieldType) context.mapperService().fieldType(fieldName)).toDoubleValue(
+                        dimensionValue = ((FieldValueConverter) context.mapperService().fieldType(fieldName)).toDoubleValue(
                             dimensionLongValue
                         );
+                    } else if (valuesSource.isBigInteger()) {
+                        // An unsigned_long dimension holds the 64 bits of the value, as its doc values do
+                        dimensionValue = Numbers.unsignedLongToDouble(dimensionLongValue);
                     } else {
                         dimensionValue = dimensionLongValue;
                     }

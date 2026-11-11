@@ -42,8 +42,12 @@ import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.Plugin;
+import org.opensearch.script.Script;
+import org.opensearch.script.ScriptType;
 import org.opensearch.search.aggregations.AbstractAggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.AggregationTestScriptsPlugin;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.AggregatorFactory;
@@ -51,6 +55,7 @@ import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
@@ -60,6 +65,7 @@ import org.opensearch.search.aggregations.startree.DateHistogramAggregatorTests;
 import org.opensearch.search.aggregations.startree.NumericTermsAggregatorTests;
 import org.opensearch.search.aggregations.startree.StarTreeFilterTests;
 import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
+import org.opensearch.search.aggregations.support.ValueType;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.AliasFilter;
@@ -75,6 +81,7 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -1197,6 +1204,88 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         ).subAggregation(max("max").field(STATUS));
     }
 
+    /**
+     * A terms or range aggregation on a field the index does not map has no field, and one with a missing value or a value
+     * script reads values the star-tree has no data for: the star-tree declines them, so the request takes the regular path
+     * instead of failing the shard or counting the wrong documents.
+     */
+    public void testAggregationsWithoutIndexedFieldValuesAreNotResolvedByTheStarTree() throws IOException {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(
+                StarTreeFilterTests.getExpandedMapping(
+                    1,
+                    false,
+                    StarTreeFilterTests.DIMENSION_TYPE_MAP,
+                    StarTreeFilterTests.METRIC_TYPE_MAP
+                )
+            );
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        MaxAggregationBuilder maxAgg = max("max").field("field");
+        assertTrue(
+            "terms on a dimension",
+            starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(terms("by_dv").field("dv").subAggregation(maxAgg)))
+        );
+        assertFalse(
+            "terms on an unmapped field",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(terms("by_unmapped").field("unmapped").subAggregation(maxAgg))
+            )
+        );
+        assertTrue(
+            "range on a dimension",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(range("by_dv").field("dv").addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        assertFalse(
+            "range with a missing value",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(range("by_dv").field("dv").missing(5).addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        assertFalse(
+            "range on an unmapped field",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(range("by_unmapped").field("unmapped").addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        Script valueScript = new Script(ScriptType.INLINE, AggregationTestScriptsPlugin.NAME, "_value + 1", Collections.emptyMap());
+        assertFalse(
+            "range with a value script",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0)
+                    .aggregation(range("by_dv").field("dv").script(valueScript).addRange(0, 10).subAggregation(maxAgg))
+            )
+        );
+        assertFalse(
+            "terms with a value script",
+            starTreeResolves(
+                request,
+                new SearchSourceBuilder().size(0).aggregation(terms("by_dv").field("dv").script(valueScript).subAggregation(maxAgg))
+            )
+        );
+    }
+
     private boolean starTreeResolves(ShardSearchRequest request, SearchSourceBuilder source) throws IOException {
         request.source(source);
         SearchService searchService = getInstanceFromNode(SearchService.class);
@@ -1505,5 +1594,236 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         assertStarTreeContext(request, sourceBuilder, null, -1);
 
         setStarTreeIndexSetting(null);
+    }
+
+    /**
+     * A keyword terms aggregation in {@code map} execution mode does not pre-compute with the star-tree, so the star-tree
+     * must not answer it: its metric sub-aggregations would leave their work to it and collect nothing.
+     */
+    public void testMapExecutionHintIsNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE)))));
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").executionHint("global_ordinals").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").executionHint("map").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        // Numeric terms ignore the execution hint
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field(STATUS).executionHint("map").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
+
+    /** Creates an index with the star-tree of {@link NumericTermsAggregatorTests} and a request on its shard. */
+    private ShardSearchRequest createRequestOnTermsIndex() throws IOException {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(NumericTermsAggregatorTests.getExpandedMapping(1, false));
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        return new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+    }
+
+    private static SearchSourceBuilder aggregationSource(AbstractAggregationBuilder<?> aggregation) {
+        return new SearchSourceBuilder().size(0).query(new MatchAllQueryBuilder()).aggregation(aggregation);
+    }
+
+    /**
+     * The star-tree has no entry for the documents without a value, so it must not answer a terms aggregation with
+     * {@code missing}, on a keyword or a numeric dimension.
+     */
+    public void testTermsWithMissingAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE)))));
+        assertFalse(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").missing("N/A").subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).subAggregation(sum("sum").field(SIZE)))));
+        assertFalse(
+            starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).missing(0).subAggregation(sum("sum").field(SIZE))))
+        );
+    }
+
+    @Override
+    protected Collection<Class<? extends Plugin>> getPlugins() {
+        return pluginList(AggregationTestScriptsPlugin.class);
+    }
+
+    /**
+     * The star-tree pre-aggregates the field's indexed values, so it must not answer a metric aggregation with
+     * {@code missing} or a value script, at the top level or under a terms aggregation: the regular path must answer the
+     * whole request.
+     */
+    public void testMetricsWithMissingOrScriptAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        Script valueScript = new Script(ScriptType.INLINE, AggregationTestScriptsPlugin.NAME, "_value + 1", Collections.emptyMap());
+        assertTrue(starTreeResolves(request, aggregationSource(sum("sum").field(SIZE))));
+        assertFalse(starTreeResolves(request, aggregationSource(sum("sum").field(SIZE).missing(1000))));
+        assertFalse(starTreeResolves(request, aggregationSource(sum("sum").field(SIZE).script(valueScript))));
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE)))));
+        assertFalse(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field("clientip").subAggregation(sum("sum").field(SIZE).missing(1000)))
+            )
+        );
+    }
+
+    /**
+     * A multi_terms aggregation whose terms a missing value or a script changes at read time is not answered by the star-tree,
+     * which has no data for either: the request takes the regular path, as for terms.
+     */
+    public void testMultiTermsWithMissingOrScriptAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip").build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig statusWithMissing = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setMissing(0)
+            .build();
+        MultiTermsValuesSourceConfig statusWithScript = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setScript(new Script(ScriptType.INLINE, AggregationTestScriptsPlugin.NAME, "_value + 1", Collections.emptyMap()))
+            .build();
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "missing",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusWithMissing)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "value script",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusWithScript)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
+
+    /**
+     * A multi_terms aggregation with include or exclude on one of its terms is not answered by the star-tree, which would
+     * return every combination: the request takes the regular path.
+     */
+    public void testMultiTermsWithIncludeExcludeAreNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip").build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig clientIpIncluded = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip")
+            .setIncludeExclude(new IncludeExclude(new String[] { "a" }, null))
+            .build();
+        MultiTermsValuesSourceConfig clientIpExcluded = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip")
+            .setIncludeExclude(new IncludeExclude(null, new String[] { "a" }))
+            .build();
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "include",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIpIncluded, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "exclude",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIpExcluded, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+    }
+
+    /**
+     * A {@code value_type} that reads a field as another type than its own is not answered by the star-tree, which reads
+     * the values as their own type: terms or multi_terms on a numeric dimension read as strings, or a value_count of a
+     * numeric metric read as strings, take the regular path. A {@code value_type} of the field's own type is still answered
+     * by the star-tree.
+     */
+    public void testValueTypeOfAnotherTypeIsNotResolvedByTheStarTree() throws Exception {
+        ShardSearchRequest request = createRequestOnTermsIndex();
+        assertTrue(starTreeResolves(request, aggregationSource(terms("terms").field(STATUS).subAggregation(sum("sum").field(SIZE)))));
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field(STATUS).userValueTypeHint(ValueType.LONG).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "terms on a numeric dimension read as strings",
+            starTreeResolves(
+                request,
+                aggregationSource(terms("terms").field(STATUS).userValueTypeHint(ValueType.STRING).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+
+        MultiTermsValuesSourceConfig clientIp = new MultiTermsValuesSourceConfig.Builder().setFieldName("clientip").build();
+        MultiTermsValuesSourceConfig status = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS).build();
+        MultiTermsValuesSourceConfig statusAsString = new MultiTermsValuesSourceConfig.Builder().setFieldName(STATUS)
+            .setUserValueTypeHint(ValueType.STRING)
+            .build();
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, status)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+        assertFalse(
+            "multi_terms on a numeric dimension read as strings",
+            starTreeResolves(
+                request,
+                aggregationSource(multiTerms("mt").terms(List.of(clientIp, statusAsString)).subAggregation(sum("sum").field(SIZE)))
+            )
+        );
+
+        assertTrue(
+            starTreeResolves(
+                request,
+                aggregationSource(
+                    terms("terms").field("clientip").userValueTypeHint(ValueType.STRING).subAggregation(count("count").field(SIZE))
+                )
+            )
+        );
+        assertFalse(
+            "value_count of a numeric metric read as strings",
+            starTreeResolves(
+                request,
+                aggregationSource(
+                    terms("terms").field("clientip").subAggregation(count("count").field(SIZE).userValueTypeHint(ValueType.STRING))
+                )
+            )
+        );
     }
 }

@@ -147,7 +147,11 @@ public class StarTreeQueryContext {
             MetricStat metricStat = metricAggregatorFactory.getMetricStat();
             field = metricAggregatorFactory.getField();
 
-            return field != null && supportedMetrics.containsKey(field) && supportedMetrics.get(field).contains(metricStat);
+            // The star-tree has no data for a missing value or a script
+            return field != null
+                && metricAggregatorFactory.readsIndexedFieldValues()
+                && supportedMetrics.containsKey(field)
+                && supportedMetrics.get(field).contains(metricStat);
         }
         return false;
     }
@@ -156,6 +160,11 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         TermsAggregatorFactory termsAggregatorFactory
     ) {
+        // The map execution mode does not pre-compute with the star-tree, and the star-tree has no data for a missing
+        // value or a script
+        if (termsAggregatorFactory.collectsInMapMode() || termsAggregatorFactory.readsIndexedFieldValues() == false) {
+            return false;
+        }
         // Validate request field is part of dimensions. The date dimension is stored only as its calendar-interval
         // sub-dimensions, which cannot give a term per timestamp
         return compositeIndexFieldInfo.getDimensions()
@@ -169,6 +178,10 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         RangeAggregatorFactory rangeAggregatorFactory
     ) {
+        // The star-tree has no data for a missing value or a script, and an unmapped field has no field
+        if (rangeAggregatorFactory.readsIndexedFieldValues() == false) {
+            return false;
+        }
         // Validate request field is part of dimensions & is a numeric field
         // TODO: Add support for date type ranges
         return compositeIndexFieldInfo.getDimensions()
@@ -220,6 +233,12 @@ public class StarTreeQueryContext {
             return false;
         }
 
+        // The star-tree's calendar intervals are rounded in UTC: a timestamp rounded in UTC does not tell its bucket in another
+        // time zone
+        if (dateHistogramAggregatorFactory.isUTC() == false) {
+            return false;
+        }
+
         // Find the closest valid interval in the DateTimeUnitRounding class associated with star tree
         DateTimeUnitRounding rounding = starTreeDateDimension.findClosestValidInterval(
             new DateTimeUnitAdapter(dateHistogramAggregatorFactory.getRounding())
@@ -235,6 +254,10 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         MultiTermsAggregationFactory multiTermsAggregationFactory
     ) {
+        // The star-tree has no data for a missing value or a script, as for terms, and does not apply include or exclude
+        if (multiTermsAggregationFactory.readsIndexedFieldValues() == false || multiTermsAggregationFactory.filtersTerms()) {
+            return false;
+        }
         // The date dimension is stored only as its calendar-interval sub-dimensions, as for terms
         return compositeIndexFieldInfo.getDimensions()
             .stream()

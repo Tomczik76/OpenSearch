@@ -166,4 +166,11 @@ public final class DateHistogramAggregatorFactory extends ValuesSourceAggregator
     public Rounding.DateTimeUnit getRounding() {
         return this.rounding.unit();
     }
+
+    /**
+     * Whether the histogram rounds in UTC, as the calendar intervals of a star-tree's date dimension do.
+     */
+    public boolean isUTC() {
+        return this.rounding.isUTC();
+    }
 }
