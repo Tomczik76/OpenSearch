@@ -87,9 +87,9 @@ public class StarTreeTraversalUtil {
 
             // Get the query value directly
             List<DimensionFilter> dimensionFilters = starTreeFilter.getFiltersForDimension(remainingPredicateColumn);
-            StarTreeValuesIterator valuesIterator = starTreeValues.getDimensionValuesIterator(
-                dimensionFilters.getFirst().getMatchingDimension()
-            );
+            // Read the values of the column itself: a filter that matches nothing, such as a numeric range beyond the field
+            // type's bounds, names no dimension, and may be the first of the column's filters
+            StarTreeValuesIterator valuesIterator = starTreeValues.getDimensionValuesIterator(remainingPredicateColumn);
 
             // Clear the temporary bit set before reuse
             tempBitSet.clear(0, starTreeResult.maxMatchedDoc + 1);

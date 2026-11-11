@@ -51,7 +51,12 @@ public class StarTreeQueryHelper {
      * Checks if the search context can be supported by star-tree
      */
     public static boolean isStarTreeSupported(SearchContext context) {
-        return context.aggregations() != null && context.mapperService().isCompositeIndexPresent() && context.parsedPostFilter() == null;
+        return context.aggregations() != null && context.mapperService().isCompositeIndexPresent() && context.parsedPostFilter() == null
+        // The star-tree pre-computes whole segments: it cannot apply a minimum score, stop after a number of documents,
+        // or keep only one slice's documents
+            && context.minimumScore() == null
+            && context.terminateAfter() == SearchContext.DEFAULT_TERMINATE_AFTER
+            && (context.request() == null || context.request().source() == null || context.request().source().slice() == null);
     }
 
     public static CompositeIndexFieldInfo getSupportedStarTree(QueryShardContext context) {
@@ -220,8 +225,11 @@ public class StarTreeQueryHelper {
         for (String baseDimension : baseStarTreeFilter.getDimensions()) {
             dimensionFilterMap.put(baseDimension, baseStarTreeFilter.getFiltersForDimension(baseDimension));
         }
-        // Don't add groupBy when already present in base filter.
-        if (!dimensionFilterMap.containsKey(dimensionToMerge)) {
+        // Don't add groupBy when already present in base filter. A base filter on a date sub-dimension is stored
+        // under the field's name (e.g. "@timestamp" for "@timestamp_hour"), so compare matching dimensions too:
+        // traversal looks the sub-dimension up by key first and would apply only the groupBy's match-all.
+        if (dimensionFilterMap.containsKey(dimensionToMerge) == false
+            && baseStarTreeFilter.getMatchingDimensions().contains(dimensionToMerge) == false) {
             dimensionFilterMap.put(dimensionToMerge, dimensionFiltersToMerge);
         }
         return new StarTreeFilter(dimensionFilterMap);
@@ -256,7 +264,8 @@ public class StarTreeQueryHelper {
         List<DimensionFilter> dimensionFiltersToMerge = new ArrayList<>(initialDimensionFilters);
 
         for (Aggregator subAgg : subAggregators) {
-            if (subAgg instanceof StarTreePreComputeCollector collector) {
+            // With profile, every sub-aggregator is wrapped in a ProfilingAggregator
+            if (subAgg.unwrapAggregator() instanceof StarTreePreComputeCollector collector) {
                 List<DimensionFilter> childFilters = collector.getDimensionFilters();
                 dimensionFiltersToMerge.addAll(childFilters != null ? childFilters : Collections.emptyList());
             }

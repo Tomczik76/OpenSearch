@@ -63,7 +63,9 @@ public class StarTreeQueryContext {
         compositeMappedFieldType = (CompositeDataCubeFieldType) context.mapperService().getCompositeFieldTypes().iterator().next();
         // need to cache star tree values only for multiple aggregations
         boolean cacheStarTreeValues = context.aggregations().factories().getFactories().length > 1;
-        int cacheSize = cacheStarTreeValues ? context.indexShard().segments(false).size() : -1;
+        // Indexed by the searcher's leaf ordinals, so sized from the searcher: a reader kept across requests, such as a
+        // point in time, can have more segments than the shard has after a merge.
+        int cacheSize = cacheStarTreeValues ? context.searcher().getLeafContexts().size() : -1;
         if (cacheSize > -1) {
             perSegmentNodeIdsCache = new FixedBitSet[cacheSize];
         } else {
@@ -154,9 +156,11 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         TermsAggregatorFactory termsAggregatorFactory
     ) {
-        // Validate request field is part of dimensions
+        // Validate request field is part of dimensions. The date dimension is stored only as its calendar-interval
+        // sub-dimensions, which cannot give a term per timestamp
         return compositeIndexFieldInfo.getDimensions()
             .stream()
+            .filter(dimension -> dimension instanceof DateDimension == false)
             .map(Dimension::getField)
             .anyMatch(termsAggregatorFactory.getField()::equals);
     }
@@ -231,8 +235,10 @@ public class StarTreeQueryContext {
         CompositeDataCubeFieldType compositeIndexFieldInfo,
         MultiTermsAggregationFactory multiTermsAggregationFactory
     ) {
+        // The date dimension is stored only as its calendar-interval sub-dimensions, as for terms
         return compositeIndexFieldInfo.getDimensions()
             .stream()
+            .filter(dimension -> dimension instanceof DateDimension == false)
             .map(Dimension::getField)
             .collect(Collectors.toSet())
             .containsAll(multiTermsAggregationFactory.getRequestFields());

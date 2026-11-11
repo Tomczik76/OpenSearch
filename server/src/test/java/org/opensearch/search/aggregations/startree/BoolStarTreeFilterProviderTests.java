@@ -33,6 +33,7 @@ import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.mapper.StarTreeMapper;
 import org.opensearch.index.mapper.WildcardFieldMapper;
 import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -49,6 +50,7 @@ import org.junit.Before;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -1333,6 +1335,61 @@ public class BoolStarTreeFilterProviderTests extends OpenSearchTestCase {
 
         // this should return null as must not clause is not supported
         assertNull("Filter should be null for same dimension in MUST", filter);
+    }
+
+    public void testMustNotNextToOtherClausesReturnsNull() throws IOException {
+        // The star-tree cannot exclude documents: a must_not next to other clauses must not be dropped
+        for (BoolQueryBuilder boolQuery : List.of(
+            new BoolQueryBuilder().filter(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200)),
+            new BoolQueryBuilder().must(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200)),
+            new BoolQueryBuilder().should(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200)),
+            new BoolQueryBuilder().filter(
+                new BoolQueryBuilder().must(new TermQueryBuilder(METHOD, "GET")).mustNot(new TermQueryBuilder(STATUS, 200))
+            )
+        )) {
+            StarTreeFilterProvider provider = StarTreeFilterProvider.SingletonFactory.getProvider(boolQuery);
+            assertNull(boolQuery.toString(), provider.getFilter(searchContext, boolQuery, compositeFieldType));
+        }
+    }
+
+    /**
+     * OR'd alternatives on a dimension, narrowed by a clause on the same dimension, in either order, keep exactly the
+     * alternatives the clause allows: every alternative is intersected with the clause, none is dropped, and the clause is
+     * neither ignored nor added as another alternative.
+     */
+    public void testAlternativesOnADimensionSurviveALaterClause() throws IOException {
+        // A should of GET, POST or PUT, and a terms clause of GET or POST on the same dimension: GET and POST remain
+        QueryBuilder alternatives = new BoolQueryBuilder().should(new TermQueryBuilder(METHOD, "GET"))
+            .should(new TermQueryBuilder(METHOD, "POST"))
+            .should(new TermQueryBuilder(METHOD, "PUT"));
+        QueryBuilder narrowing = new TermsQueryBuilder(METHOD, "GET", "POST");
+        for (BoolQueryBuilder boolQuery : List.of(
+            new BoolQueryBuilder().filter(alternatives).filter(narrowing),
+            new BoolQueryBuilder().filter(narrowing).filter(alternatives)
+        )) {
+            StarTreeFilter filter = StarTreeFilterProvider.SingletonFactory.getProvider(boolQuery)
+                .getFilter(searchContext, boolQuery, compositeFieldType);
+
+            assertNotNull(boolQuery.toString(), filter);
+            assertEquals(Set.of(METHOD), filter.getDimensions());
+            List<String> values = new ArrayList<>();
+            for (DimensionFilter methodFilter : filter.getFiltersForDimension(METHOD)) {
+                ((ExactMatchDimFilter) methodFilter).getRawValues().forEach(value -> values.add(((BytesRef) value).utf8ToString()));
+            }
+            values.sort(null);
+            assertEquals(boolQuery.toString(), List.of("GET", "POST"), values);
+        }
+    }
+
+    public void testClauseThatMatchesNothingNextToAnotherOnTheSameDimensionReturnsNull() throws IOException {
+        // A range beyond the field type's bounds matches nothing; intersecting it used to fail the request
+        for (BoolQueryBuilder boolQuery : List.of(
+            new BoolQueryBuilder().filter(new TermQueryBuilder(STATUS, 200)).filter(new RangeQueryBuilder(STATUS).gt(Integer.MAX_VALUE)),
+            new BoolQueryBuilder().filter(new RangeQueryBuilder(STATUS).gt(Integer.MAX_VALUE)).filter(new TermQueryBuilder(STATUS, 200))
+        )) {
+            StarTreeFilterProvider provider = StarTreeFilterProvider.SingletonFactory.getProvider(boolQuery);
+            assertNull(boolQuery.toString(), provider.getFilter(searchContext, boolQuery, compositeFieldType));
+        }
     }
 
     // Helper methods for assertions

@@ -31,7 +31,6 @@ import org.opensearch.index.compositeindex.datacube.startree.StarTreeField;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeFieldConfiguration;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettings;
 import org.opensearch.index.compositeindex.datacube.startree.utils.date.DateTimeUnitAdapter;
-import org.opensearch.index.engine.Segment;
 import org.opensearch.index.mapper.CompositeDataCubeFieldType;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.MapperService;
@@ -64,6 +63,7 @@ import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.AliasFilter;
+import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.ReaderContext;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.internal.ShardSearchRequest;
@@ -587,15 +587,14 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         QueryBuilder baseQuery = new MatchAllQueryBuilder();
         SearchContext searchContext = mock(SearchContext.class);
         MapperService mapperService = mock(MapperService.class);
-        IndexShard indexShard = mock(IndexShard.class);
-        Segment segment = mock(Segment.class);
         SearchContextAggregations searchContextAggregations = mock(SearchContextAggregations.class);
         AggregatorFactories aggregatorFactories = mock(AggregatorFactories.class);
 
         when(mapperService.getCompositeFieldTypes()).thenReturn(Set.of(compositeDataCubeFieldType));
         when(searchContext.mapperService()).thenReturn(mapperService);
-        when(searchContext.indexShard()).thenReturn(indexShard);
-        when(indexShard.segments(false)).thenReturn(List.of(segment, segment));
+        ContextIndexSearcher searcher = mock(ContextIndexSearcher.class);
+        when(searchContext.searcher()).thenReturn(searcher);
+        when(searcher.getLeafContexts()).thenReturn(Collections.nCopies(2, null));
         when(searchContext.aggregations()).thenReturn(searchContextAggregations);
         when(searchContextAggregations.factories()).thenReturn(aggregatorFactories);
         when(aggregatorFactories.getFactories()).thenReturn(new AggregatorFactory[] { null, null });
@@ -1074,6 +1073,139 @@ public class SearchServiceStarTreeTests extends OpenSearchSingleNodeTestCase {
         assertStarTreeContext(request, sourceBuilder, null, -1);
 
         setStarTreeIndexSetting(null);
+    }
+
+    /**
+     * The node-id cache is indexed by the searcher's leaf ordinals. A reader kept across requests, such as a point in
+     * time, can have more segments than the shard has after a merge, so the cache must be sized from the searcher.
+     */
+    public void testNodeIdCacheIsSizedFromTheSearcher() throws Exception {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(Settings.builder().put(starStreeEnabledIndexSettings).put("index.refresh_interval", "-1"))
+            .setMapping(
+                StarTreeFilterTests.getExpandedMapping(
+                    1,
+                    false,
+                    StarTreeFilterTests.DIMENSION_TYPE_MAP,
+                    StarTreeFilterTests.METRIC_TYPE_MAP
+                )
+            );
+        createIndex("test", builder);
+        for (int segment = 0; segment < 3; segment++) {
+            client().prepareIndex("test").setSource("sndv", segment, "field", segment).get();
+            client().admin().indices().prepareRefresh("test").get();
+        }
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        // Two aggregations turn the cache on
+        request.source(new SearchSourceBuilder().size(0).aggregation(max("max").field("field")).aggregation(sum("sum").field("field")));
+        SearchService searchService = getInstanceFromNode(SearchService.class);
+        try (ReaderContext reader = searchService.createOrGetReaderContext(request, false)) {
+            client().admin().indices().prepareForceMerge("test").setMaxNumSegments(1).setFlush(true).get();
+            client().admin().indices().prepareRefresh("test").get();
+            assertEquals(1, indexShard.segments(false).size());
+            try (SearchContext context = searchService.createContext(reader, request, null, true)) {
+                assertEquals(3, context.searcher().getLeafContexts().size());
+                StarTreeQueryContext starTreeQueryContext = context.getQueryShardContext().getStarTreeQueryContext();
+                assertNotNull("the star-tree must resolve the request", starTreeQueryContext);
+                assertEquals(3, starTreeQueryContext.getAllCachedValues().length);
+            }
+        }
+    }
+
+    /** The star-tree pre-computes whole segments, so it must not answer requests that keep only some documents. */
+    public void testRequestsThatLimitDocumentsAreNotResolvedByTheStarTree() throws Exception {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(
+                StarTreeFilterTests.getExpandedMapping(
+                    1,
+                    false,
+                    StarTreeFilterTests.DIMENSION_TYPE_MAP,
+                    StarTreeFilterTests.METRIC_TYPE_MAP
+                )
+            );
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        assertTrue(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(max("max").field("field"))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).minScore(1f).aggregation(max("max").field("field"))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).terminateAfter(10).aggregation(max("max").field("field"))));
+    }
+
+    /**
+     * The star-tree stores the date dimension only as its calendar-interval sub-dimensions, which cannot give a term per
+     * timestamp: it must not resolve a terms or multi_terms aggregation on the date field, and still resolves them on other
+     * dimensions.
+     */
+    public void testTermsOnTheDateFieldAreNotResolvedByTheStarTree() throws Exception {
+        CreateIndexRequestBuilder builder = client().admin()
+            .indices()
+            .prepareCreate("test")
+            .setSettings(starStreeEnabledIndexSettings)
+            .setMapping(DateHistogramAggregatorTests.getExpandedMapping(1, false));
+        createIndex("test", builder);
+        IndexShard indexShard = getInstanceFromNode(IndicesService.class).indexServiceSafe(resolveIndex("test")).getShard(0);
+        ShardSearchRequest request = new ShardSearchRequest(
+            OriginalIndices.NONE,
+            new SearchRequest().allowPartialSearchResults(true),
+            indexShard.shardId(),
+            1,
+            new AliasFilter(null, Strings.EMPTY_ARRAY),
+            1.0f,
+            -1,
+            null,
+            null
+        );
+        assertTrue(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(termsWithMax(STATUS))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(termsWithMax(TIMESTAMP_FIELD))));
+        assertTrue(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(multiTermsWithMax(STATUS, SIZE))));
+        assertFalse(starTreeResolves(request, new SearchSourceBuilder().size(0).aggregation(multiTermsWithMax(TIMESTAMP_FIELD, STATUS))));
+    }
+
+    private static TermsAggregationBuilder termsWithMax(String field) {
+        return terms("terms").field(field).subAggregation(max("max").field(STATUS));
+    }
+
+    private static MultiTermsAggregationBuilder multiTermsWithMax(String... fields) {
+        return multiTerms("multi_terms").terms(
+            Arrays.stream(fields).map(field -> new MultiTermsValuesSourceConfig.Builder().setFieldName(field).build()).toList()
+        ).subAggregation(max("max").field(STATUS));
+    }
+
+    private boolean starTreeResolves(ShardSearchRequest request, SearchSourceBuilder source) throws IOException {
+        request.source(source);
+        SearchService searchService = getInstanceFromNode(SearchService.class);
+        try (
+            ReaderContext reader = searchService.createOrGetReaderContext(request, false);
+            SearchContext context = searchService.createContext(reader, request, null, true)
+        ) {
+            return context.getQueryShardContext().getStarTreeQueryContext() != null;
+        }
     }
 
     private void setStarTreeIndexSetting(String value) {
