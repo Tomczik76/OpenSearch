@@ -440,6 +440,39 @@ public class NumberFieldTypeTests extends FieldTypeTestCase {
         assertEquals("Cannot search on field [field] since it is both not indexed, and does not have doc_values enabled.", e.getMessage());
     }
 
+    /**
+     * An exclusive upper bound on an unsigned_long matches every value below it, the maximum value included as a bound:
+     * {@code lt 18446744073709551615} matches everything but the maximum, and only {@code lt 0} matches nothing; a negative
+     * bound is rejected.
+     */
+    public void testUnsignedLongRangeQueryAtTheBoundsOfTheType() throws IOException {
+        BigInteger max = Numbers.MAX_UNSIGNED_LONG_VALUE;
+        try (Directory directory = newDirectory(); IndexWriter w = new IndexWriter(directory, new IndexWriterConfig(null))) {
+            for (BigInteger value : List.of(BigInteger.ZERO, BigInteger.ONE, max.subtract(BigInteger.ONE), max)) {
+                Document doc = new Document();
+                doc.add(new BigIntegerPoint("ul", value));
+                w.addDocument(doc);
+            }
+            try (DirectoryReader reader = DirectoryReader.open(w)) {
+                IndexSearcher searcher = newSearcher(reader);
+                assertEquals("lt max", 3, count(searcher, null, max, true, false));
+                assertEquals("lte max", 4, count(searcher, null, max, true, true));
+                assertEquals("gte 0 lt max", 3, count(searcher, BigInteger.ZERO, max, true, false));
+                assertEquals("lt 1", 1, count(searcher, null, BigInteger.ONE, true, false));
+                assertEquals("lt 0", 0, count(searcher, null, BigInteger.ZERO, true, false));
+                assertEquals("gt max", 0, count(searcher, max, null, false, true));
+                assertEquals("gt max - 1", 1, count(searcher, max.subtract(BigInteger.ONE), null, false, true));
+                // A bound below the type's minimum is rejected, so lt 0 is the only bound that leaves nothing below it
+                expectThrows(IllegalArgumentException.class, () -> count(searcher, null, BigInteger.valueOf(-1), true, false));
+            }
+        }
+    }
+
+    private static int count(IndexSearcher searcher, BigInteger from, BigInteger to, boolean includeLower, boolean includeUpper)
+        throws IOException {
+        return searcher.count(NumberType.UNSIGNED_LONG.rangeQuery("ul", from, to, includeLower, includeUpper, false, true, MOCK_QSC));
+    }
+
     public void testUnsignedLongTermsQuery() {
         MappedFieldType ft = new NumberFieldMapper.NumberFieldType("field", NumberFieldMapper.NumberType.UNSIGNED_LONG);
         Query expected = new IndexOrDocValuesQuery(
